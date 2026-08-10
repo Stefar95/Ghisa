@@ -1,5 +1,11 @@
-import { Dumbbell, X } from "lucide-react";
-import { PAYPAL_LINK } from "../config";
+import { Dumbbell, X, Heart } from "lucide-react";
+import * as appConfig from "../config";
+
+// Accetta sia SATISPAY_LINK sia i vecchi nomi, così config.js non va per forza toccato
+const cfg = appConfig;
+const DONATION_LINK =
+  cfg["SATISPAY_LINK"] || cfg["DONATION_LINK"] || cfg["PAYPAL_LINK"] || "";
+const isValidLink = /^https?:\/\//i.test(DONATION_LINK.trim());
 
 export default function InfoModal({ isAdmin, onClose }) {
   return (
@@ -25,17 +31,36 @@ export default function InfoModal({ isAdmin, onClose }) {
           Ideata da <span style={{ color: "var(--ink)", fontWeight: 600 }}>Stefano</span>.
         </p>
 
-        {isAdmin && PAYPAL_LINK && (
-          <a
-            href={PAYPAL_LINK}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="g-empty-cta"
-            style={{ display: "block", textAlign: "center", textDecoration: "none", marginTop: 16 }}
-          >
-            Offrimi un caffè su PayPal
-          </a>
+        {isAdmin && (
+          <div className="g-donate-box">
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+              <Heart size={15} color="var(--accent)" />
+              <span style={{ fontWeight: 600, fontSize: 13.5 }}>Sostieni il progetto</span>
+            </div>
+            <p style={{ fontSize: 12.5, color: "var(--ink-dim)", margin: "0 0 12px 0", lineHeight: 1.5 }}>
+              GHISA è gratuita e senza pubblicità. Se ti è utile, puoi offrire un caffè
+              a chi la sviluppa.
+            </p>
+            {isValidLink ? (
+              <a
+                href={DONATION_LINK.trim()}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="g-empty-cta"
+                style={{ display: "block", textAlign: "center", textDecoration: "none", marginTop: 0 }}
+              >
+                Dona con Satispay
+              </a>
+            ) : (
+              <div style={{ fontSize: 11.5, color: "var(--ink-dim)", fontStyle: "italic" }}>
+                {DONATION_LINK.trim()
+                  ? <>Il valore in <code>src/config.js</code> non è un link valido: deve iniziare con https://</>
+                  : <>Link Satispay non ancora configurato: impostalo in <code>src/config.js</code>.</>}
+              </div>
+            )}
+          </div>
         )}
+
       </div>
     </div>
   );

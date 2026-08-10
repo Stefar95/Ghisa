@@ -1,6 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from "react";
 import {
-  Dumbbell,
   Flame,
   Trash2,
   Plus,
@@ -13,12 +12,19 @@ import {
   RotateCcw,
   X,
 } from "lucide-react";
-import { uid, confirmThen, todayISO, formatDate, formatMMSS, STEPS } from "../lib/utils";
+import {
+  uid, confirmThen, todayISO, formatDate, formatMMSS, STEPS,
+  getReps, getBackoffReps, getBackoffPercent, repsLabel,
+  getExType, isTimeBased, isAmrap, logSummary,
+  flattenSteps, restAfterPart, getCombo, comboLabel, getParts, partAmountLabel, dayOptions, getDays,
+} from "../lib/utils";
 import BodyDiagram from "./BodyDiagram";
 import ExercisePicker from "./ExercisePicker";
 
-export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBatch, onDelete, onDeleteBatch, onUpdate, draft, onSaveDraft }) {
+export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBatch, onDelete, onDeleteBatch, onUpdate, draft, onSaveDraft, activeSchedaId }) {
   const [dayId, setDayId] = useState(() => (draft ? draft.dayId : null));
+  // Prima si sceglie la scheda (di default quella attiva), poi il giorno
+  const [schedaSel, setSchedaSel] = useState(null);
   const [stepIdx, setStepIdx] = useState(() => (draft ? draft.stepIdx || 0 : 0));
   const [session, setSession] = useState(() => (draft ? draft.session || [] : []));
   const [exerciseInput, setExerciseInput] = useState("");
@@ -27,10 +33,14 @@ export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBa
   const [sets, setSets] = useState(3);
   const [reps, setReps] = useState(10);
   const [isBackoff, setIsBackoff] = useState(false);
+  // Serie uniformi (stesso carico e ripetizioni) oppure una riga per serie
+  const [uniform, setUniform] = useState(true);
+  const [setRows, setSetRows] = useState([]);
   const [date, setDate] = useState(() => (draft ? draft.date : todayISO()));
   const [sessionNote, setSessionNote] = useState(() => (draft ? draft.note || "" : ""));
   const [timerRemaining, setTimerRemaining] = useState(0);
   const [timerRunning, setTimerRunning] = useState(false);
+  const [timerMode, setTimerMode] = useState("rest"); // 'rest' | 'exercise' 
   const [expanded, setExpanded] = useState(() => new Set());
   const [editingId, setEditingId] = useState(null);
   const [editDraft, setEditDraft] = useState(null);
@@ -38,10 +48,76 @@ export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBa
   const [completed, setCompleted] = useState(false);
   const [showBodyDiagram, setShowBodyDiagram] = useState(false);
 
-  const selectedScheda = schede.find((s) => s.id === dayId) || null;
-  const dayName = selectedScheda ? selectedScheda.name : dayId === "libero" ? "Giorno libero" : "";
-  const currentItem = selectedScheda ? selectedScheda.items[stepIdx] : null;
-  const currentRest = currentItem?.restSeconds || 0;
+  // In allenamento uso solo le schede mie: quelle passate ad altri non contano
+  const mieSchede = useMemo(
+    () => schede.filter((s) => !(s.assignedTo || []).length),
+    [schede]
+  );
+  // Ogni scheda può contenere più giorni: qui li elenchiamo tutti insieme
+  const allDays = useMemo(() => dayOptions(mieSchede), [mieSchede]);
+
+  // All'apertura propone la scheda attiva; se sto riprendendo una sessione
+  // sospesa, risale alla scheda a cui appartiene il giorno salvato.
+  useEffect(() => {
+    if (schedaSel !== null) return;
+    if (dayId === "libero") {
+      setSchedaSel("libero");
+      return;
+    }
+    if (dayId) {
+      const opt = allDays.find((o) => o.id === dayId);
+      if (opt) {
+        setSchedaSel(opt.scheda.id);
+        return;
+      }
+    }
+    if (activeSchedaId && mieSchede.some((s) => s.id === activeSchedaId)) {
+      setSchedaSel(activeSchedaId);
+    }
+  }, [allDays, activeSchedaId, mieSchede, dayId, schedaSel]);
+
+  const selectedSchedaObj = mieSchede.find((s) => s.id === schedaSel) || null;
+  const schedaDays = selectedSchedaObj ? getDays(selectedSchedaObj) : [];
+
+  const chooseScheda = (value) => {
+    setSchedaSel(value || null);
+    if (value === "libero") {
+      setDayId("libero");
+    } else if (value) {
+      const days = getDays(mieSchede.find((s) => s.id === value) || {});
+      setDayId(days.length === 1 ? days[0].id : null);
+    } else {
+      setDayId(null);
+    }
+  };
+  const selectedOption = allDays.find((o) => o.id === dayId) || null;
+  const selectedScheda = selectedOption ? selectedOption.day : null;
+  const dayName = selectedOption ? selectedOption.label : dayId === "libero" ? "Giorno libero" : "";
+  // Ogni riga di scheda può contenere più esercizi (superset/jumpset):
+  // qui li appiattiamo per poterli percorrere uno alla volta.
+  const steps = useMemo(
+    () => (selectedScheda ? flattenSteps(selectedScheda.items) : []),
+    [selectedScheda]
+  );
+  const totalSteps = steps.length;
+  const currentStep = steps[stepIdx] || null;
+  const currentBlock = currentStep?.item || null;   // la riga della scheda
+  const currentItem = currentStep?.part || null;    // il singolo esercizio
+  const combo = currentBlock ? getCombo(currentBlock) : "none";
+  const blockParts = currentBlock ? getParts(currentBlock) : [];
+  const restInfo = currentBlock
+    ? restAfterPart(currentBlock, currentStep.partIdx)
+    : { seconds: 0, kind: "rest" };
+  const currentRest = restInfo.seconds;
+  // Tipo di esercizio: in "giorno libero" resta sempre a ripetizioni con carico
+  const exType = currentItem ? getExType(currentItem) : "reps";
+  const noWeight = currentItem ? !!currentItem.noWeight : false;
+  const timeBased = exType === "time";
+  const amrap = exType === "amrap";
+  const amountStep = timeBased ? 5 : 1;
+  // Il timer cronometra il recupero, oppure la durata dell'esercizio se è a tempo
+  const activeTimerMode = timeBased ? (currentRest > 0 ? timerMode : "exercise") : "rest";
+  const activeTimerDuration = activeTimerMode === "exercise" ? reps || 0 : currentRest;
 
   // Al primo render non azzerare lo step se stiamo ripristinando una bozza sospesa
   useEffect(() => {
@@ -51,11 +127,21 @@ export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBa
     }
     setStepIdx(0);
     setCompleted(false);
-  }, [dayId]);
+    // Nuova sessione (nessun esercizio ancora aggiunto): proponi sempre oggi
+    if (session.length === 0) setDate(todayISO());
+  }, [dayId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     setShowBodyDiagram(false);
   }, [dayId, stepIdx]);
+
+  // Se la scheda viene modificata (meno esercizi) mentre è in corso una
+  // sessione, riporta lo step dentro i limiti invece di restare bloccato.
+  useEffect(() => {
+    if (selectedScheda && totalSteps > 0 && stepIdx >= totalSteps) {
+      setStepIdx(totalSteps - 1);
+    }
+  }, [totalSteps, stepIdx, selectedScheda]);
 
   // Salva automaticamente la sessione in corso, così puoi tornarci più tardi e continuare
   useEffect(() => {
@@ -79,12 +165,15 @@ export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBa
 
   useEffect(() => {
     if (selectedScheda) {
-      const item = selectedScheda.items[stepIdx];
+      const item = steps[stepIdx];
       if (item) {
-        setExerciseInput(item.exercise);
-        setSets(item.sets);
-        setReps(item.reps);
+        setExerciseInput(item.part.exercise);
+        setSets(item.item.sets);
+        // A sfinimento: partiamo da 0, le ripetizioni le segni tu a fine serie
+        setReps(getExType(item.part) === "amrap" ? 0 : getReps(item.part).max);
         setIsBackoff(false);
+        setUniform(true);
+        setSetRows([]);
       }
     } else {
       setExerciseInput("");
@@ -96,17 +185,22 @@ export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBa
   }, [dayId, stepIdx]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
+    if (noWeight) return; // esercizio a corpo libero: il carico non serve
     const relevant = logs
-      .filter((l) => l.exercise === exerciseInput && !l.backoff)
+      .filter((l) => l.exercise === exerciseInput && !l.backoff && !l.noWeight)
       .sort((a, b) => (a.id < b.id ? 1 : -1));
     if (relevant.length) setWeight(relevant[0].weight);
-    else setWeight(20); // nessuno storico per questo esercizio: non tenere il peso (ridotto) dell'esercizio precedente
+    else setWeight(20); // nessuno storico: non tenere il peso (ridotto) dell'esercizio precedente
   }, [exerciseInput]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
-    setTimerRemaining(currentRest);
+    setTimerMode(isTimeBased(currentItem) ? "exercise" : "rest");
+  }, [dayId, stepIdx]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    setTimerRemaining(activeTimerDuration);
     setTimerRunning(false);
-  }, [dayId, stepIdx, currentRest]);
+  }, [dayId, stepIdx, activeTimerMode, activeTimerDuration]);
 
   useEffect(() => {
     if (!timerRunning) return;
@@ -133,25 +227,86 @@ export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBa
     }
   };
   const goNext = () => {
-    if (selectedScheda && stepIdx < selectedScheda.items.length - 1) setStepIdx((i) => i + 1);
+    if (selectedScheda && stepIdx < totalSteps - 1) setStepIdx((i) => i + 1);
   };
+
+  // Passa da "serie tutte uguali" a "una riga per serie" e viceversa
+  const toggleUniform = (nextUniform) => {
+    if (!nextUniform) {
+      setSetRows(
+        Array.from({ length: Math.max(1, sets) }, () => ({
+          weight: noWeight ? 0 : weight,
+          reps,
+        }))
+      );
+    }
+    setUniform(nextUniform);
+  };
+
+  const updateSetRow = (i, patch) =>
+    setSetRows((prev) => prev.map((r, idx) => (idx === i ? { ...r, ...patch } : r)));
+
+  const addSetRow = () =>
+    setSetRows((prev) => [...prev, { ...(prev[prev.length - 1] || { weight, reps }) }]);
+
+  const removeSetRow = (i) => setSetRows((prev) => prev.filter((_, idx) => idx !== i));
 
   const addToSession = () => {
     if (!exerciseInput.trim()) return;
-    setSession((prev) => [
-      ...prev,
-      { tempId: uid(), exercise: exerciseInput.trim(), weight, sets, reps, backoff: isBackoff },
-    ]);
+
+    // Serie differenziate: salvo il dettaglio riga per riga e uso come valore
+    // di riferimento la serie più pesante (o la migliore, se a corpo libero)
+    let entry;
+    if (!uniform && setRows.length) {
+      const rows = setRows.map((r) => ({
+        weight: noWeight ? 0 : Number(r.weight) || 0,
+        reps: Number(r.reps) || 0,
+      }));
+      const best = rows.reduce(
+        (acc, r) => (noWeight ? (r.reps > acc.reps ? r : acc) : r.weight > acc.weight ? r : acc),
+        rows[0]
+      );
+      entry = {
+        tempId: uid(),
+        exercise: exerciseInput.trim(),
+        weight: best.weight,
+        sets: rows.length,
+        reps: best.reps,
+        setDetails: rows,
+        backoff: isBackoff,
+        type: exType,
+        noWeight,
+        warmup: !!currentBlock?.warmup,
+      };
+    } else {
+      entry = {
+        tempId: uid(),
+        exercise: exerciseInput.trim(),
+        weight: noWeight ? 0 : weight,
+        sets,
+        reps,
+        backoff: isBackoff,
+        type: exType,
+        noWeight,
+        warmup: !!currentBlock?.warmup,
+      };
+    }
+
+    setSession((prev) => [...prev, entry]);
+    setUniform(true);
+    setSetRows([]);
 
     if (currentItem && currentItem.backoffSets > 0 && !isBackoff) {
       // Appena aggiunto il top set: proponi subito il back-off dello stesso esercizio,
-      // con peso ridotto del 30% (arrotondato per eccesso)
+      // con peso ridotto della percentuale impostata per questo esercizio (arrotondato per eccesso)
+      const pct = getBackoffPercent(currentItem);
+      const base = entry.weight || weight;
       setIsBackoff(true);
       setSets(currentItem.backoffSets);
-      setReps(currentItem.backoffReps);
-      setWeight(Math.ceil(weight * 0.7));
+      setReps(getBackoffReps(currentItem).max);
+      setWeight(Math.ceil(base * (1 - pct / 100)));
     } else if (selectedScheda) {
-      if (stepIdx < selectedScheda.items.length - 1) {
+      if (stepIdx < totalSteps - 1) {
         goNext();
       } else {
         setCompleted(true);
@@ -178,6 +333,9 @@ export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBa
         sets: e.sets,
         reps: e.reps,
         backoff: e.backoff,
+        type: e.type || "reps",
+        noWeight: !!e.noWeight,
+        warmup: !!e.warmup,
         dayId,
         dayName,
         date,
@@ -187,6 +345,8 @@ export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBa
       setSession([]);
       setSessionNote("");
       setDayId(null);
+      if (schedaSel === "libero") setSchedaSel(null);
+      setDate(todayISO());
     });
   };
 
@@ -205,7 +365,10 @@ export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBa
       }
       map.get(key).entries.push(l);
     });
-    return Array.from(map.values()).sort((a, b) => (a.key < b.key ? 1 : -1));
+    return Array.from(map.values()).sort((a, b) => {
+      if (a.date !== b.date) return a.date < b.date ? 1 : -1;
+      return a.key < b.key ? 1 : -1;
+    });
   }, [logs]);
 
   const toggleExpanded = (key) => {
@@ -223,6 +386,12 @@ export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBa
     });
   };
 
+  // Cambia la data dell'intero allenamento (tutti gli esercizi di quella sessione)
+  const changeSessionDate = (group, newDate) => {
+    if (!newDate || newDate === group.date) return;
+    group.entries.forEach((e) => onUpdate(e.id, { date: newDate }));
+  };
+
   const startEditEntry = (l) => {
     setEditingId(l.id);
     setEditDraft({ weight: l.weight, sets: l.sets, reps: l.reps, backoff: !!l.backoff });
@@ -236,7 +405,9 @@ export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBa
   const saveEditEntry = () => {
     if (!editingId || !editDraft) return;
     confirmThen("Salvare le modifiche a questo esercizio?", () => {
-      onUpdate(editingId, editDraft);
+      // La modifica riporta l'esercizio a serie uniformi: il dettaglio
+      // riga-per-riga non sarebbe più coerente con i valori inseriti qui.
+      onUpdate(editingId, { ...editDraft, setDetails: null });
       setEditingId(null);
       setEditDraft(null);
     });
@@ -281,18 +452,42 @@ export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBa
   return (
     <div>
       <div style={{ marginBottom: 14 }}>
-        <div className="g-field-label">Giorno</div>
+        <div className="g-field-label">Scheda</div>
         <select
           className="g-input g-select"
-          value={dayId || ""}
-          onChange={(e) => setDayId(e.target.value || null)}
+          value={schedaSel || ""}
+          onChange={(e) => chooseScheda(e.target.value)}
         >
-          <option value="" disabled>Scegli un giorno...</option>
-          {schede.map((s) => (
-            <option key={s.id} value={s.id}>{s.name}</option>
+          <option value="" disabled>Scegli una scheda...</option>
+          {mieSchede.map((s) => (
+            <option key={s.id} value={s.id}>
+              {s.id === activeSchedaId ? `★ ${s.name}` : s.name}
+            </option>
           ))}
-          <option value="libero">Giorno libero</option>
+          <option value="libero">— Giorno libero —</option>
         </select>
+
+        {schedaSel && schedaSel !== "libero" && (
+          <>
+            <div className="g-field-label" style={{ marginTop: 12 }}>Giorno</div>
+            <select
+              className="g-input g-select"
+              value={dayId || ""}
+              onChange={(e) => setDayId(e.target.value || null)}
+            >
+              <option value="" disabled>Scegli un giorno...</option>
+              {schedaDays.map((d) => (
+                <option key={d.id} value={d.id}>{d.name}</option>
+              ))}
+            </select>
+          </>
+        )}
+
+        {schedaSel === "libero" && (
+          <div className="g-free-day-hint">
+            Giorno libero: registri quello che vuoi, senza seguire una scheda.
+          </div>
+        )}
       </div>
 
       {!dayId ? (
@@ -309,64 +504,26 @@ export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBa
           </button>
         </div>
       )}
-      <div className="g-card" style={{ marginBottom: 14 }}>
-        <label className="g-field-label">Data sessione</label>
-        <input
-          className="g-input"
-          type="date"
-          value={date}
-          onChange={(e) => setDate(e.target.value)}
-        />
-        <label className="g-field-label" style={{ marginTop: 12 }}>Note (opzionale)</label>
+      <div className="g-card" style={{ marginBottom: 14, padding: "12px 14px" }}>
+        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          <label className="g-field-label" style={{ marginBottom: 0, flexShrink: 0 }}>Data</label>
+          <input
+            className="g-input"
+            type="date"
+            style={{ padding: "8px 10px" }}
+            value={date}
+            onChange={(e) => setDate(e.target.value)}
+          />
+        </div>
+        <label className="g-field-label" style={{ marginTop: 12 }}>Note</label>
         <textarea
           className="g-input"
           rows={2}
           style={{ resize: "vertical", fontFamily: "inherit" }}
           value={sessionNote}
           onChange={(e) => setSessionNote(e.target.value)}
-          placeholder=""
         />
       </div>
-
-      {selectedScheda && !completed && (
-        <div className="g-card" style={{ marginBottom: 14, padding: "12px 14px" }}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-            <div className="g-field-label" style={{ marginBottom: 0 }}>
-              Esercizio {stepIdx + 1} di {selectedScheda.items.length}
-            </div>
-            <div style={{ display: "flex", gap: 6 }}>
-              <button className="g-icon-btn" onClick={goPrev} disabled={stepIdx === 0}>
-                <ChevronLeft size={15} />
-              </button>
-              <button
-                className="g-icon-btn"
-                onClick={goNext}
-                disabled={stepIdx === selectedScheda.items.length - 1}
-              >
-                <ChevronRight size={15} />
-              </button>
-            </div>
-          </div>
-          {(exerciseMeta[currentItem?.exercise] || []).length > 0 && (
-            <div style={{ marginTop: 10 }}>
-              <button
-                className="g-icon-btn"
-                style={{ fontSize: 12, gap: 5 }}
-                onClick={() => setShowBodyDiagram((v) => !v)}
-              >
-                <Dumbbell size={13} />
-                {(exerciseMeta[currentItem.exercise] || []).join(", ")}
-                {showBodyDiagram ? " ▲" : " ▼"}
-              </button>
-              {showBodyDiagram && (
-                <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px solid var(--line)" }}>
-                  <BodyDiagram selected={exerciseMeta[currentItem.exercise] || []} size={64} />
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-      )}
 
       {selectedScheda && completed && (
         <div className="g-card" style={{ marginBottom: 14, textAlign: "center", padding: "30px 20px" }}>
@@ -389,17 +546,104 @@ export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBa
 
       {(!selectedScheda || !completed) && (
       <div className="g-card">
-        <label className="g-field-label">Esercizio</label>
-        <ExercisePicker
-          exercises={exercises}
-          value={exerciseInput}
-          onChange={setExerciseInput}
-          placeholder="Es. Panca piana, Squat, Stacco..."
-          locked={!!selectedScheda}
-        />
+        {selectedScheda ? (
+          <>
+            <div className="g-ex-head">
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div className="g-ex-meta">
+                  Esercizio {stepIdx + 1}/{totalSteps}
+                  {(exerciseMeta[currentItem?.exercise] || []).length > 0 && (
+                    <>
+                      {" · "}
+                      <button
+                        className="g-parts-link"
+                        onClick={() => setShowBodyDiagram((v) => !v)}
+                      >
+                        {(exerciseMeta[currentItem.exercise] || []).join(", ")}
+                        {showBodyDiagram ? " ▲" : " ▼"}
+                      </button>
+                    </>
+                  )}
+                </div>
+                <div className="g-ex-name">{exerciseInput}</div>
+                <div className="g-ex-tags">
+                  <span className="g-tag g-tag-target">
+                    {currentBlock.sets}x{partAmountLabel(currentItem)}
+                  </span>
+                  {combo !== "none" && (
+                    <span className="g-tag g-tag-link">
+                      {comboLabel(combo)} {currentStep.partIdx + 1}/{blockParts.length}
+                    </span>
+                  )}
+                  {currentBlock?.warmup && <span className="g-tag g-tag-warm">Riscaldamento</span>}
+                  {noWeight && <span className="g-tag">Corpo libero</span>}
+                  {amrap && <span className="g-tag">A sfinimento</span>}
+                </div>
+              </div>
+              <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                <button className="g-icon-btn" onClick={goPrev} disabled={stepIdx === 0}>
+                  <ChevronLeft size={15} />
+                </button>
+                <button
+                  className="g-icon-btn"
+                  onClick={goNext}
+                  disabled={stepIdx === totalSteps - 1}
+                >
+                  <ChevronRight size={15} />
+                </button>
+              </div>
+            </div>
+            {currentBlock?.note && (
+              <div className="g-ex-note">{currentBlock.note}</div>
+            )}
+            {restInfo.kind === "superset" && (
+              <div className="g-ex-note g-ex-note-link">
+                Superset: subito dopo → {restInfo.nextExercise}
+              </div>
+            )}
+            {showBodyDiagram && (exerciseMeta[currentItem?.exercise] || []).length > 0 && (
+              <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px solid var(--line)" }}>
+                <BodyDiagram selected={exerciseMeta[currentItem.exercise] || []} size={64} />
+              </div>
+            )}
+          </>
+        ) : (
+          <>
+            <label className="g-field-label">Esercizio</label>
+            <ExercisePicker
+              exercises={exercises}
+              value={exerciseInput}
+              onChange={setExerciseInput}
+              placeholder=""
+            />
+          </>
+        )}
 
+        <div className="g-seg" style={{ marginTop: 18 }}>
+          <button
+            className={`g-seg-btn ${uniform ? "active" : ""}`}
+            onClick={() => toggleUniform(true)}
+          >
+            Serie uguali
+          </button>
+          <button
+            className={`g-seg-btn ${!uniform ? "active" : ""}`}
+            onClick={() => toggleUniform(false)}
+          >
+            Serie diverse
+          </button>
+        </div>
+
+        {!noWeight && uniform && (
         <div style={{ marginTop: 20 }}>
-          <label className="g-field-label" style={{ textAlign: "center" }}>Peso</label>
+          <label className="g-field-label" style={{ textAlign: "center" }}>
+            Peso
+            {isBackoff && currentItem && (
+              <span style={{ color: "var(--steel)", fontWeight: 400, textTransform: "none", letterSpacing: 0 }}>
+                {" "}(-{getBackoffPercent(currentItem)}%)
+              </span>
+            )}
+          </label>
           <div className="g-weight-row">
             <button className="plate-btn" onClick={() => adjust(-weightStep)} aria-label="Diminuisci peso">
               <Minus size={22} />
@@ -430,7 +674,9 @@ export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBa
             ))}
           </div>
         </div>
+        )}
 
+        {uniform ? (
         <div className="g-sets-reps-row">
           <div className="g-sets-reps-col">
             <label className="g-field-label" style={{ textAlign: "center" }}>Serie</label>
@@ -441,28 +687,115 @@ export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBa
             </div>
           </div>
           <div className="g-sets-reps-col">
-            <label className="g-field-label" style={{ textAlign: "center" }}>Ripetizioni</label>
+            <label className="g-field-label" style={{ textAlign: "center" }}>
+              {timeBased ? "Secondi" : amrap ? "Rip. fatte" : "Ripetizioni"}
+              {currentItem && !amrap && (() => {
+                const range = isBackoff ? getBackoffReps(currentItem) : getReps(currentItem);
+                return (
+                  <span style={{ color: "var(--accent)" }}>
+                    {" "}({repsLabel(range.min, range.max)}{timeBased ? "s" : ""})
+                  </span>
+                );
+              })()}
+            </label>
             <div className="g-counter">
-              <button className="g-counter-btn" onClick={() => setReps((r) => Math.max(1, r - 1))}>−</button>
+              <button
+                className="g-counter-btn"
+                onClick={() => setReps((r) => Math.max(amrap ? 0 : 1, r - amountStep))}
+              >
+                −
+              </button>
               <div className="g-counter-num">{reps}</div>
-              <button className="g-counter-btn" onClick={() => setReps((r) => r + 1)}>+</button>
+              <button className="g-counter-btn" onClick={() => setReps((r) => r + amountStep)}>+</button>
             </div>
+            {amrap && <div className="g-range-badge">Fino a sfinimento</div>}
           </div>
         </div>
+        ) : (
+          <div className="g-sets-wrap">
+            <div className="g-field-label" style={{ textAlign: "center" }}>Serie svolte</div>
+            {setRows.map((r, i) => (
+              <div className="g-set-row" key={i}>
+                <span className="g-set-num">{i + 1}ª</span>
+                {!noWeight && (
+                  <>
+                    <input
+                      className="g-input g-set-input ghisa-mono"
+                      type="number"
+                      step="0.5"
+                      value={r.weight}
+                      onChange={(e) => updateSetRow(i, { weight: e.target.value })}
+                    />
+                    <span className="g-set-unit">kg</span>
+                  </>
+                )}
+                <input
+                  className="g-input g-set-input ghisa-mono"
+                  type="number"
+                  min="0"
+                  value={r.reps}
+                  onChange={(e) => updateSetRow(i, { reps: e.target.value })}
+                />
+                <span className="g-set-unit">{timeBased ? "sec" : "rip"}</span>
+                {setRows.length > 1 && (
+                  <button className="g-del-btn" onClick={() => removeSetRow(i)} aria-label="Togli serie">
+                    <X size={14} />
+                  </button>
+                )}
+              </div>
+            ))}
+            <button
+              className="g-icon-btn"
+              style={{ width: "100%", justifyContent: "center", padding: 8, marginTop: 2 }}
+              onClick={addSetRow}
+            >
+              <Plus size={14} /> Aggiungi serie
+            </button>
+          </div>
+        )}
 
-        <label className="g-checkbox-row" style={{ justifyContent: "center" }}>
-          <input
-            type="checkbox"
-            checked={isBackoff}
-            onChange={(e) => setIsBackoff(e.target.checked)}
-          />
-          Questa è una serie back-off
-        </label>
+        {!noWeight && !amrap && (
+          <div className="g-toggle-row">
+            <button
+              className={`g-toggle-pill ${isBackoff ? "active" : ""}`}
+              onClick={() => setIsBackoff((v) => !v)}
+            >
+              Serie back-off
+            </button>
+          </div>
+        )}
 
-        {currentRest > 0 && (
+        {(currentRest > 0 || timeBased) && (
           <div className="g-timer-box">
-            <div className="g-timer-label">Recupero consigliato</div>
-            <div className="g-timer-display ghisa-mono">{formatMMSS(timerRemaining)}</div>
+            {timeBased && currentRest > 0 && (
+              <div className="g-timer-tabs">
+                <button
+                  className={`g-step-pill ${timerMode === "exercise" ? "active" : ""}`}
+                  onClick={() => setTimerMode("exercise")}
+                >
+                  Esercizio
+                </button>
+                <button
+                  className={`g-step-pill ${timerMode === "rest" ? "active" : ""}`}
+                  onClick={() => setTimerMode("rest")}
+                >
+                  Recupero
+                </button>
+              </div>
+            )}
+            <div className="g-timer-label">
+              {activeTimerMode === "exercise"
+                ? "Durata esercizio"
+                : restInfo.kind === "jumpset"
+                ? `Jumpset — 1' poi ${restInfo.nextExercise}`
+                : "Recupero consigliato"}
+            </div>
+            <div
+              className="g-timer-display ghisa-mono"
+              style={timerRemaining === 0 && !timerRunning ? { color: "var(--accent)" } : undefined}
+            >
+              {formatMMSS(timerRemaining)}
+            </div>
             <div style={{ display: "flex", gap: 8, justifyContent: "center" }}>
               <button className="g-icon-btn" onClick={() => setTimerRunning((r) => !r)} style={{ gap: 5 }}>
                 {timerRunning ? <Pause size={14} /> : <Play size={14} />}
@@ -471,7 +804,7 @@ export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBa
               <button
                 className="g-icon-btn"
                 onClick={() => {
-                  setTimerRemaining(currentRest);
+                  setTimerRemaining(activeTimerDuration);
                   setTimerRunning(false);
                 }}
                 style={{ gap: 5 }}
@@ -507,7 +840,7 @@ export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBa
                     {e.exercise}
                     {e.backoff && <span style={{ color: "var(--steel)", fontSize: 11 }}> · back-off</span>}
                   </div>
-                  <div className="g-history-sets">{e.sets} x {e.reps} @ {e.weight} kg</div>
+                  <div className="g-history-sets">{logSummary(e)}</div>
                 </div>
                 <button className="g-del-btn" onClick={() => removeFromSession(e.tempId)} aria-label="Rimuovi">
                   <X size={16} />
@@ -566,6 +899,18 @@ export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBa
 
                   {isOpen && (
                     <div style={{ marginTop: 10, borderTop: "1px solid var(--line)", paddingTop: 8 }}>
+                      <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 10 }}>
+                        <label className="g-field-label" style={{ marginBottom: 0, flexShrink: 0 }}>
+                          Data allenamento
+                        </label>
+                        <input
+                          className="g-input"
+                          type="date"
+                          style={{ padding: "7px 10px", fontSize: 13 }}
+                          value={g.date}
+                          onChange={(e) => changeSessionDate(g, e.target.value)}
+                        />
+                      </div>
                       {g.note && (
                         <div style={{ fontSize: 12, color: "var(--ink-dim)", fontStyle: "italic", marginBottom: 8 }}>
                           "{g.note}"
@@ -634,7 +979,7 @@ export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBa
                                 {l.exercise}
                                 {l.backoff && <span style={{ color: "var(--steel)", fontSize: 11 }}> · back-off</span>}
                               </div>
-                              <div className="g-history-sets">{l.sets} x {l.reps} @ {l.weight} kg</div>
+                              <div className="g-history-sets">{logSummary(l)}</div>
                             </div>
                             <div style={{ display: "flex", gap: 4 }}>
                               <button className="g-del-btn" onClick={() => startEditEntry(l)} aria-label="Modifica">
@@ -659,7 +1004,7 @@ export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBa
                             exercises={exercises}
                             value={addDraft.exercise}
                             onChange={(v) => setAddDraft((d) => ({ ...d, exercise: v }))}
-                            placeholder="Nome esercizio"
+                            placeholder=""
                           />
                           <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
                             <div style={{ flex: 1 }}>

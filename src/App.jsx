@@ -1,12 +1,14 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { Dumbbell, ListChecks, BarChart3, Unlock, Info, Sun, Moon, LogIn } from "lucide-react";
+import { Dumbbell, ListChecks, BarChart3, Unlock, Info, Sun, Moon, LogIn, User } from "lucide-react";
 
 import { auth, googleProvider, db } from "./firebase";
 import { signInWithPopup, signOut, onAuthStateChanged } from "firebase/auth";
-import { doc, setDoc, onSnapshot } from "firebase/firestore";
+import { doc, setDoc, onSnapshot, collection, addDoc, deleteDoc, query, where } from "firebase/firestore";
 import { ADMIN_EMAIL } from "./config";
+import { uid, confirmThen } from "./lib/utils";
 
 import InfoModal from "./components/InfoModal";
+import AccountModal from "./components/AccountModal";
 import StatsPage from "./components/StatsPage";
 import LogPage from "./components/LogPage";
 import SchedeManager from "./components/SchedeManager";
@@ -17,6 +19,7 @@ const LOG_KEY = "ghisa-logs";
 const SCHEDE_KEY = "ghisa-schede";
 const EX_META_KEY = "ghisa-exercise-meta";
 const DRAFT_KEY = "ghisa-draft-session";
+const ACTIVE_KEY = "ghisa-active-scheda";
 
 export default function App() {
   const [view, setView] = useState("stats"); // 'stats' | 'log' | 'admin'
@@ -25,11 +28,13 @@ export default function App() {
   const [schede, setSchede] = useState([]);
   const [exerciseMeta, setExerciseMeta] = useState({});
   const [draftSession, setDraftSession] = useState(null);
+  const [activeSchedaId, setActiveSchedaId] = useState(null);
   const [authUser, setAuthUser] = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [loading, setLoading] = useState(true);
   const [saveError, setSaveError] = useState(false);
   const [infoOpen, setInfoOpen] = useState(false);
+  const [accountOpen, setAccountOpen] = useState(false);
   const [theme, setTheme] = useState(() => {
     try {
       return localStorage.getItem("ghisa-theme") || "dark";
@@ -55,11 +60,40 @@ export default function App() {
     return unsub;
   }, []);
 
-  const isAdmin = !!authUser && authUser.email === ADMIN_EMAIL;
+  const isAdmin = !!authUser && authUser.email?.toLowerCase().trim() === ADMIN_EMAIL.toLowerCase().trim();
+  const [isPT, setIsPT] = useState(false);
+  const [assignments, setAssignments] = useState([]);
+  const isStaff = isAdmin || isPT;
 
   useEffect(() => {
-    if (view === "admin" && authUser && !isAdmin) setView("stats");
-  }, [view, authUser, isAdmin]);
+    if (view === "admin" && authUser && !isStaff) setView("stats");
+  }, [view, authUser, isStaff]);
+
+  // Registra/aggiorna il proprio profilo nella directory utenti (email, nome,
+  // ultimo accesso) e resta in ascolto del proprio ruolo (l'admin può
+  // assegnare/togliere Personal Trainer dalla pagina Utenti).
+  useEffect(() => {
+    if (!authUser) {
+      setIsPT(false);
+      return;
+    }
+    const ref = doc(db, "directory", authUser.uid);
+    setDoc(
+      ref,
+      {
+        email: authUser.email,
+        displayName: authUser.displayName || "",
+        lastSeen: Date.now(),
+      },
+      { merge: true }
+    ).catch((e) => console.error(e));
+    const unsub = onSnapshot(
+      ref,
+      (snap) => setIsPT(!!(snap.exists() && snap.data().isPT)),
+      (e) => console.error(e)
+    );
+    return unsub;
+  }, [authUser]);
 
   const signIn = useCallback(() => {
     signInWithPopup(auth, googleProvider).catch((e) => console.error(e));
@@ -85,6 +119,7 @@ export default function App() {
     let sc = [];
     let meta = {};
     let draft = null;
+    let active = null;
     try {
       const raw = localStorage.getItem(EX_KEY);
       if (raw) ex = JSON.parse(raw);
@@ -115,11 +150,18 @@ export default function App() {
     } catch (e) {
       /* nessun dato salvato ancora */
     }
+    try {
+      const raw = localStorage.getItem(ACTIVE_KEY);
+      if (raw) active = JSON.parse(raw);
+    } catch (e) {
+      /* nessun dato salvato ancora */
+    }
     setExercises(ex);
     setLogs(lg);
     setSchede(sc);
     setExerciseMeta(meta);
     setDraftSession(draft);
+    setActiveSchedaId(active);
     setLoading(false);
   }, []);
 
@@ -166,6 +208,12 @@ export default function App() {
             setSchede(data.schede);
             try { localStorage.setItem(SCHEDE_KEY, JSON.stringify(data.schede)); } catch (e) {}
           }
+          if (data.activeSchedaId !== undefined) {
+            setActiveSchedaId(data.activeSchedaId);
+            try {
+              localStorage.setItem(ACTIVE_KEY, JSON.stringify(data.activeSchedaId));
+            } catch (e) {}
+          }
           if (data.draftSession !== undefined) {
             setDraftSession(data.draftSession);
             try {
@@ -178,7 +226,7 @@ export default function App() {
           // Primo accesso di questo account: l'admin porta su i propri dati
           // locali esistenti; ogni altro utente parte pulito, per non
           // ritrovarsi con la scheda/gli allenamenti di qualcun altro.
-          const isThisAdmin = authUser.email === ADMIN_EMAIL;
+          const isThisAdmin = authUser.email?.toLowerCase().trim() === ADMIN_EMAIL.toLowerCase().trim();
           const initial = isThisAdmin
             ? { logs: logsRef.current, schede: schedeRef.current, draftSession: draftRef.current }
             : { logs: [], schede: [], draftSession: null };
@@ -189,6 +237,21 @@ export default function App() {
           }
         }
       },
+      (e) => console.error(e)
+    );
+    return unsub;
+  }, [authUser]);
+
+  // Schede assegnate a me da admin o personal trainer
+  useEffect(() => {
+    if (!authUser) {
+      setAssignments([]);
+      return;
+    }
+    const q = query(collection(db, "assignments"), where("toUid", "==", authUser.uid));
+    const unsub = onSnapshot(
+      q,
+      (snap) => setAssignments(snap.docs.map((d) => ({ id: d.id, ...d.data() }))),
       (e) => console.error(e)
     );
     return unsub;
@@ -205,9 +268,10 @@ export default function App() {
       }
 
       if (key === EX_KEY || key === EX_META_KEY) {
-        // Anagrafica condivisa: scrivibile solo dall'admin (le regole di
-        // sicurezza di Firestore rifiutano il resto, la UI qui è già
-        // riservata all'admin).
+        // Anagrafica condivisa: unica per tutti. Chiunque sia autenticato può
+        // aggiungere esercizi (anche creando una scheda), così l'elenco resta
+        // lo stesso per admin, personal trainer e utenti normali.
+        if (!authUser) return;
         const field = key === EX_KEY ? "exercises" : "exerciseMeta";
         setDoc(doc(db, "shared", "registry"), { [field]: value }, { merge: true }).catch((e) =>
           console.error(e)
@@ -216,7 +280,11 @@ export default function App() {
       }
 
       if (authUser) {
-        const field = key === LOG_KEY ? "logs" : key === SCHEDE_KEY ? "schede" : key === DRAFT_KEY ? "draftSession" : null;
+        const field =
+          key === LOG_KEY ? "logs" :
+          key === SCHEDE_KEY ? "schede" :
+          key === DRAFT_KEY ? "draftSession" :
+          key === ACTIVE_KEY ? "activeSchedaId" : null;
         if (field) {
           setDoc(doc(db, "users", authUser.uid), { [field]: value }, { merge: true }).catch((e) =>
             console.error(e)
@@ -311,6 +379,34 @@ export default function App() {
     },
     [persist]
   );
+
+  // Dopo una pulizia del database, azzera anche la copia locale su questo
+  // dispositivo: altrimenti la cache continuerebbe a mostrare i dati vecchi.
+  const wipeLocal = useCallback((targets) => {
+    const clear = (key) => {
+      try {
+        localStorage.removeItem(key);
+      } catch (e) {
+        /* ignora */
+      }
+    };
+    if (targets.includes("esercizi")) {
+      setExercises([]);
+      setExerciseMeta({});
+      clear(EX_KEY);
+      clear(EX_META_KEY);
+    }
+    if (targets.includes("allenamenti")) {
+      setLogs([]);
+      setDraftSession(null);
+      clear(LOG_KEY);
+      clear(DRAFT_KEY);
+    }
+    if (targets.includes("schede")) {
+      setSchede([]);
+      clear(SCHEDE_KEY);
+    }
+  }, []);
 
   const addExerciseToRegistry = useCallback(
     (name) => {
@@ -456,6 +552,43 @@ export default function App() {
     [persist]
   );
 
+  // Accetta una scheda assegnata: entra tra le mie e diventa modificabile da me
+  const acceptAssignment = useCallback(
+    (a) => {
+      // La scheda assegnata diventa una mia copia, con giorni e id nuovi
+      const src = a.scheda || {};
+      const nuova = {
+        id: uid(),
+        name: src.name || "Scheda assegnata",
+        days: (Array.isArray(src.days) && src.days.length
+          ? src.days
+          : [{ id: uid(), name: src.name || "Giorno 1", items: src.items || [] }]
+        ).map((d) => ({ ...d, id: uid() })),
+      };
+      setSchede((prev) => {
+        const next = [...prev, nuova];
+        persist(SCHEDE_KEY, next);
+        return next;
+      });
+      deleteDoc(doc(db, "assignments", a.id)).catch((e) => console.error(e));
+    },
+    [persist]
+  );
+
+  const rejectAssignment = useCallback((a) => {
+    confirmThen(`Rifiutare la scheda "${a.scheda?.name}"?`, () => {
+      deleteDoc(doc(db, "assignments", a.id)).catch((e) => console.error(e));
+    });
+  }, []);
+
+  const setActiveScheda = useCallback(
+    (id) => {
+      setActiveSchedaId(id);
+      persist(ACTIVE_KEY, id);
+    },
+    [persist]
+  );
+
   const deleteScheda = useCallback(
     (id) => {
       setSchede((prev) => {
@@ -463,8 +596,12 @@ export default function App() {
         persist(SCHEDE_KEY, next);
         return next;
       });
+      if (activeSchedaId === id) {
+        setActiveSchedaId(null);
+        persist(ACTIVE_KEY, null);
+      }
     },
-    [persist]
+    [persist, activeSchedaId]
   );
 
   return (
@@ -511,6 +648,12 @@ export default function App() {
           -webkit-appearance: none;
           appearance: none;
         }
+        input[type="number"] { -moz-appearance: textfield; }
+        input[type="number"]::-webkit-outer-spin-button,
+        input[type="number"]::-webkit-inner-spin-button {
+          -webkit-appearance: none;
+          margin: 0;
+        }
         input[type="date"] {
           font-family: 'Inter', sans-serif;
           color-scheme: dark;
@@ -531,10 +674,14 @@ export default function App() {
         }
         @media (min-width: 1024px) {
           .ghisa-root {
-            max-width: 820px;
+            max-width: 980px;
           }
           .g-sets-reps-row { gap: 60px; }
           .g-stat-grid { gap: 16px; }
+          .g-tab { font-size: 13.5px; padding: 13px 8px 14px 8px; }
+        }
+        @media (min-width: 1400px) {
+          .ghisa-root { max-width: 1160px; }
         }
         .ghisa-display { font-family: 'Oswald', sans-serif; }
         .ghisa-mono { font-family: 'JetBrains Mono', monospace; font-variant-numeric: tabular-nums; }
@@ -543,6 +690,7 @@ export default function App() {
           border-bottom: 1px solid var(--line);
           padding: 20px 20px 0 20px;
         }
+
         .g-title {
           font-size: 26px;
           font-weight: 700;
@@ -562,24 +710,52 @@ export default function App() {
           margin-top: 2px;
           margin-bottom: 14px;
         }
-        .g-tabs { display: flex; gap: 14px; }
+        .g-tabs { display: flex; gap: 6px; width: 100%; }
         .g-tab {
+          flex: 1 1 0;
+          min-width: 0;
           background: none;
           border: none;
           color: var(--ink-dim);
           font-family: 'Oswald', sans-serif;
-          font-size: 12.5px;
-          letter-spacing: 0.06em;
+          font-size: 10.5px;
+          letter-spacing: 0.03em;
           text-transform: uppercase;
-          padding: 10px 2px 12px 2px;
+          padding: 8px 2px 9px 2px;
           cursor: pointer;
-          border-bottom: 2px solid transparent;
+          border-bottom: 2px solid var(--line);
+          /* Su telefono icona sopra e testo sotto: quattro voci ci stanno
+             senza tagliare le parole. */
           display: flex;
+          flex-direction: column;
           align-items: center;
-          gap: 5px;
+          justify-content: flex-end;
+          gap: 4px;
+          line-height: 1.1;
           white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          touch-action: manipulation;
         }
-        .g-tab.active { color: var(--ink); border-bottom-color: var(--accent); }
+        .g-tab svg { flex-shrink: 0; }
+        .g-tab > span { max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+
+        /* Da tablet in su torna comodo affiancare icona e testo */
+        @media (min-width: 620px) {
+          .g-tabs { gap: 10px; }
+          .g-tab {
+            flex-direction: row;
+            justify-content: center;
+            font-size: 12.5px;
+            padding: 11px 6px 12px 6px;
+            gap: 6px;
+          }
+        }
+        .g-tab.active {
+          color: var(--ink);
+          border-bottom-color: var(--accent);
+          background: linear-gradient(to bottom, transparent 55%, var(--accent-dim));
+        }
         .g-tab:hover { color: var(--ink); }
 
         .g-body { padding: 20px; }
@@ -693,7 +869,9 @@ export default function App() {
           .g-weight-row { gap: 10px; }
           .g-body { padding: 16px; }
           .g-title { font-size: 22px; }
+          .g-tab { font-size: 9.5px; padding: 7px 1px 8px 1px; }
         }
+
 
         .g-counter-btn, .g-del-btn, .g-chip, .g-step-pill {
           touch-action: manipulation;
@@ -805,7 +983,65 @@ export default function App() {
         .g-sets-reps-row {
           display: flex; justify-content: center; gap: 32px; margin-top: 22px;
         }
+        .g-danger-banner {
+          display: flex; align-items: flex-start; gap: 8px;
+          background: rgba(193,80,46,0.12); border: 1px solid var(--accent);
+          border-radius: 10px; padding: 10px 12px; margin-bottom: 14px;
+          font-size: 12.5px; color: var(--ink); line-height: 1.45;
+        }
+        .g-danger-banner svg { flex-shrink: 0; margin-top: 1px; color: var(--accent); }
+
+        .g-ex-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+
+        .g-tag {
+          display: inline-block; font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em;
+          font-weight: 600; padding: 2px 7px; border-radius: 5px; margin-right: 5px;
+          background: var(--surface-2); color: var(--ink-dim); border: 1px solid var(--line);
+          white-space: nowrap; line-height: 1.25;
+        }
+        .g-tag-warm { background: rgba(214,158,46,0.16); color: #d69e2e; border-color: rgba(214,158,46,0.4); }
+        .g-tag-link { background: rgba(124,139,153,0.18); color: var(--steel); border-color: var(--steel); }
+        .g-ex-note {
+          margin-top: 10px; padding: 8px 10px; border-radius: 8px;
+          background: var(--surface-2); border-left: 3px solid var(--accent);
+          font-size: 12.5px; color: var(--ink); line-height: 1.4; font-style: italic;
+        }
+        .g-ex-note-link { border-left-color: var(--steel); font-style: normal; font-weight: 600; }
+        .g-tag-target {
+          background: var(--accent-dim); color: var(--accent); border-color: var(--accent);
+          font-size: 13px; padding: 4px 11px; border-radius: 7px;
+          font-family: 'JetBrains Mono', monospace; letter-spacing: 0;
+          text-transform: none; line-height: 1.25;
+        }
+        .g-ex-tags { margin-top: 6px; display: flex; flex-wrap: wrap; align-items: center; gap: 5px; }
+        .g-ex-tags .g-tag { margin-right: 0; }
+
+        .g-seg { display: flex; gap: 6px; }
+        .g-seg-btn {
+          flex: 1; padding: 9px 4px; border-radius: 9px; border: 1px solid var(--line);
+          background: var(--surface-2); color: var(--ink-dim); font-size: 12px; font-weight: 600;
+          cursor: pointer; white-space: nowrap;
+        }
+        .g-seg-btn.active { border-color: var(--accent); color: var(--ink); background: var(--accent-dim); }
+
+        .g-timer-tabs { display: flex; gap: 6px; justify-content: center; margin-bottom: 10px; }
+        .g-ex-meta {
+          font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.06em;
+          color: var(--ink-dim); margin-bottom: 2px;
+        }
+        .g-ex-name {
+          font-family: 'Oswald', sans-serif; font-size: 19px; font-weight: 600;
+          letter-spacing: 0.01em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        }
+        .g-parts-link {
+          background: none; border: none; padding: 0; cursor: pointer;
+          color: var(--accent); font: inherit; letter-spacing: inherit; text-transform: inherit;
+        }
         .g-sets-reps-col { display: flex; flex-direction: column; align-items: center; }
+        .g-range-badge {
+          margin-top: 6px; font-size: 10.5px; color: var(--steel);
+          background: var(--surface-2); padding: 2px 8px; border-radius: 999px; font-weight: 600;
+        }
 
         .g-session-name { font-weight: 600; font-size: 14px; }
         .g-note-dot { color: var(--accent); font-size: 8px; margin-left: 6px; vertical-align: middle; }
@@ -852,6 +1088,64 @@ export default function App() {
           display: flex; align-items: center; justify-content: space-between; gap: 10px;
         }
         .g-scheda-row:last-child { border-bottom: none; }
+        .g-menu {
+          position: absolute; top: calc(100% + 6px); right: 0; z-index: 40;
+          min-width: 178px; background: var(--surface-2); border: 1px solid var(--line);
+          border-radius: 10px; padding: 5px; box-shadow: 0 12px 28px rgba(0,0,0,0.45);
+        }
+        .g-menu-item {
+          display: flex; align-items: center; gap: 9px; width: 100%;
+          background: none; border: none; color: var(--ink); cursor: pointer;
+          padding: 9px 10px; border-radius: 7px; font-size: 13px; text-align: left;
+        }
+        .g-menu-item:hover { background: var(--accent-dim); }
+        .g-menu-item svg { color: var(--ink-dim); flex-shrink: 0; }
+        .g-menu-danger { color: var(--accent); }
+        .g-menu-danger svg { color: var(--accent); }
+        .g-menu-danger:hover { background: rgba(193,80,46,0.14); }
+
+        .g-active-badge {
+          display: inline-flex; align-items: center; gap: 3px; margin-left: 8px;
+          background: rgba(143,185,150,0.16); color: var(--success);
+          border: 1px solid rgba(143,185,150,0.45);
+          font-size: 9.5px; font-weight: 700; text-transform: uppercase;
+          letter-spacing: 0.05em; padding: 2px 7px; border-radius: 999px;
+          vertical-align: middle;
+        }
+        .g-scheda-active { border-left: 3px solid var(--success); padding-left: 9px; margin-left: -12px; }
+
+        .g-free-day-hint {
+          margin-top: 10px; padding: 9px 11px; border-radius: 9px;
+          background: var(--surface-2); border: 1px dashed var(--line);
+          font-size: 12px; color: var(--ink-dim); line-height: 1.4;
+        }
+
+        .g-donate-box {
+          margin-top: 20px; padding: 14px; border-radius: 12px;
+          background: var(--surface-2); border: 1px solid var(--line);
+        }
+        .g-donate-box code {
+          background: var(--surface); padding: 1px 5px; border-radius: 4px; font-size: 11px;
+        }
+
+        .g-rest-stepper {
+          display: flex; align-items: center; gap: 6px;
+        }
+        .g-rest-value {
+          flex: 1; text-align: center; font-size: 15px; font-weight: 700;
+          background: var(--surface); border: 1px solid var(--line);
+          border-radius: 8px; padding: 7px 4px;
+        }
+
+        .g-day-row {
+          display: flex; align-items: center; gap: 4px;
+          background: var(--surface-2); border: 1px solid var(--line);
+          border-radius: 10px; padding: 10px 12px; margin-bottom: 6px;
+        }
+        .g-day-ex-list {
+          margin: 4px 0 0 0; padding-left: 16px; color: var(--ink-dim);
+          font-size: 12px; line-height: 1.6;
+        }
         .g-scheda-item-view {
           padding: 8px 4px; margin-left: 4px; border-left: 2px solid var(--line); padding-left: 12px; margin-bottom: 6px;
           font-size: 13px;
@@ -879,6 +1173,70 @@ export default function App() {
           font-size: 13px;
         }
         .g-draft-item-active { border: 1px solid var(--accent); }
+        .g-draft-item-moving { opacity: 0.55; border: 1px dashed var(--accent); }
+        .g-move-bar {
+          display: flex; align-items: center; justify-content: space-between; gap: 8px;
+          background: var(--accent-dim); border: 1px solid var(--accent); border-radius: 8px;
+          padding: 8px 10px; margin-bottom: 8px; font-size: 12px;
+        }
+        .g-move-bar .g-del-btn { color: var(--accent); font-weight: 600; font-size: 12px; padding: 2px 4px; }
+        .g-move-slot {
+          display: flex; align-items: center; justify-content: center; gap: 6px;
+          width: 100%; margin-bottom: 6px; padding: 7px;
+          background: none; border: 1px dashed var(--accent); border-radius: 8px;
+          color: var(--accent); font-size: 11.5px; font-weight: 600; cursor: pointer;
+        }
+        .g-move-slot:hover { background: var(--accent-dim); }
+
+        .g-block-form {
+          margin-top: 14px; padding-top: 14px; border-top: 1px dashed var(--line);
+        }
+        .g-part-card {
+          background: var(--surface-2); border: 1px solid var(--line);
+          border-radius: 10px; padding: 12px; margin-bottom: 8px;
+        }
+        .g-part-card .g-input { background: var(--surface); }
+
+        .g-set-row {
+          display: flex; align-items: center; gap: 6px; margin-bottom: 6px;
+        }
+        .g-set-num {
+          width: 26px; flex-shrink: 0; font-size: 12px; font-weight: 700;
+          color: var(--ink-dim); font-family: 'Oswald', sans-serif;
+        }
+        .g-set-input {
+          flex: 1; min-width: 0; text-align: center; padding: 8px 4px; font-size: 15px;
+          -moz-appearance: textfield;
+        }
+        .g-set-input::-webkit-outer-spin-button,
+        .g-set-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+        .g-set-unit {
+          font-size: 10.5px; color: var(--ink-dim); text-transform: uppercase;
+          letter-spacing: 0.04em; width: 24px; flex-shrink: 0;
+        }
+        .g-set-row .g-del-btn { opacity: 0.5; }
+        .g-set-row:hover .g-del-btn { opacity: 1; }
+        .g-sets-wrap {
+          margin-top: 18px; background: var(--surface-2); border: 1px solid var(--line);
+          border-radius: 12px; padding: 12px;
+        }
+        .g-sets-wrap .g-input { background: var(--surface); }
+
+        .g-toggle-row { display: flex; justify-content: center; margin-top: 16px; }
+        .g-toggle-pill {
+          border: 1px solid var(--line); background: var(--surface-2); color: var(--ink-dim);
+          border-radius: 999px; padding: 7px 16px; font-size: 12.5px; font-weight: 600;
+          cursor: pointer; display: inline-flex; align-items: center; gap: 7px;
+          touch-action: manipulation;
+        }
+        .g-toggle-pill::before {
+          content: ""; width: 8px; height: 8px; border-radius: 50%;
+          background: var(--line); flex-shrink: 0;
+        }
+        .g-toggle-pill.active {
+          border-color: var(--accent); background: var(--accent-dim); color: var(--accent);
+        }
+        .g-toggle-pill.active::before { background: var(--accent); }
         .g-order-btn {
           background: none; border: none; color: var(--ink-dim); font-size: 9px; cursor: pointer;
           padding: 1px 4px; line-height: 1;
@@ -912,10 +1270,10 @@ export default function App() {
         }
       `}</style>
 
-      <div className="g-header" style={{ position: "relative", paddingRight: 96 }}>
+      <div className="g-header" style={{ position: "relative", paddingRight: 132 }}>
         <button
           className="g-info-btn"
-          style={{ right: 56 }}
+          style={{ right: 92 }}
           onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
           aria-label="Cambia tema"
         >
@@ -923,10 +1281,18 @@ export default function App() {
         </button>
         <button
           className="g-info-btn"
+          style={{ right: 56 }}
           onClick={() => setInfoOpen(true)}
           aria-label="Informazioni"
         >
           <Info size={18} />
+        </button>
+        <button
+          className="g-info-btn"
+          onClick={() => (authUser ? setAccountOpen(true) : signIn())}
+          aria-label={authUser ? "Account" : "Accedi"}
+        >
+          {authUser ? <User size={17} /> : <LogIn size={17} />}
         </button>
         <div className="g-title ghisa-display">
           <Dumbbell size={24} color="var(--accent)" />
@@ -938,35 +1304,28 @@ export default function App() {
             className={`g-tab ${view === "stats" ? "active" : ""}`}
             onClick={() => setView("stats")}
           >
-            <BarChart3 size={14} /> Statistiche
+            <BarChart3 size={15} /> <span>Statistiche</span>
           </button>
           <button
             className={`g-tab ${view === "log" ? "active" : ""}`}
             onClick={() => setView("log")}
           >
-            <ListChecks size={14} /> Allenamento
+            <ListChecks size={15} /> <span>Allenamento</span>
           </button>
           <button
             className={`g-tab ${view === "schede" ? "active" : ""}`}
             onClick={() => setView("schede")}
           >
-            <BarChart3 size={14} style={{ transform: "rotate(90deg)" }} /> Schede
+            <BarChart3 size={15} style={{ transform: "rotate(90deg)" }} /> <span>Schede</span>
           </button>
-          {!authUser ? (
+          {isStaff && (
             <button
               className={`g-tab ${view === "admin" ? "active" : ""}`}
               onClick={() => setView("admin")}
             >
-              <LogIn size={14} /> Login
+              <Unlock size={15} /> <span>Admin</span>
             </button>
-          ) : isAdmin ? (
-            <button
-              className={`g-tab ${view === "admin" ? "active" : ""}`}
-              onClick={() => setView("admin")}
-            >
-              <Unlock size={14} /> Admin
-            </button>
-          ) : null}
+          )}
         </div>
       </div>
 
@@ -979,7 +1338,7 @@ export default function App() {
         {loading ? (
           <div className="g-empty">Caricamento...</div>
         ) : view === "stats" ? (
-          <StatsPage exercises={exercises} logs={logs} goToLog={() => setView("log")} />
+          <StatsPage logs={logs} goToLog={() => setView("log")} />
         ) : view === "log" ? (
           <LogPage
             exercises={exercises}
@@ -992,6 +1351,7 @@ export default function App() {
             onUpdate={updateLog}
             draft={draftSession}
             onSaveDraft={saveDraft}
+            activeSchedaId={activeSchedaId}
           />
         ) : view === "schede" ? (
           <SchedeManager
@@ -1001,6 +1361,13 @@ export default function App() {
             onAddExercise={addExerciseToRegistry}
             onSaveScheda={saveScheda}
             onDeleteScheda={deleteScheda}
+            canAssign={isStaff}
+            authUser={authUser}
+            assignments={assignments}
+            onAcceptAssignment={acceptAssignment}
+            onRejectAssignment={rejectAssignment}
+            activeSchedaId={activeSchedaId}
+            onSetActive={setActiveScheda}
           />
         ) : (
           <AdminPage
@@ -1009,6 +1376,7 @@ export default function App() {
             logs={logs}
             authUser={authUser}
             isAdmin={isAdmin}
+            isPT={isPT}
             authLoading={authLoading}
             onSignIn={signIn}
             onSignOut={signOutUser}
@@ -1017,12 +1385,21 @@ export default function App() {
             onMergeExercises={mergeExercises}
             onRenameExercise={renameExercise}
             onSetBodyParts={setExerciseBodyParts}
+            onLocalWipe={wipeLocal}
           />
         )}
       </div>
 
       {infoOpen && <InfoModal isAdmin={isAdmin} onClose={() => setInfoOpen(false)} />}
+      {accountOpen && (
+        <AccountModal
+          authUser={authUser}
+          isAdmin={isAdmin}
+          isPT={isPT}
+          onSignOut={signOutUser}
+          onClose={() => setAccountOpen(false)}
+        />
+      )}
     </div>
   );
 }
-

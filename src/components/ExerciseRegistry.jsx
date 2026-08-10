@@ -68,7 +68,7 @@ export default function ExerciseRegistry({ exercises, exerciseMeta, logs, onAdd,
             className="g-input"
             value={name}
             onChange={(e) => setName(e.target.value)}
-            placeholder="Es. Lento avanti"
+            placeholder=""
             onKeyDown={(e) => e.key === "Enter" && submit()}
           />
           <button className="g-icon-btn" onClick={submit} style={{ padding: "0 14px" }}>

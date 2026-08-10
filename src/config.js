@@ -7,4 +7,5 @@ export const ADMIN_EMAIL = "projectste2026@gmail.com";
 
 // Link PayPal, visibile solo all'admin nella pagina Info.
 // Lascialo vuoto ("") se per ora non vuoi mostrarlo.
-export const PAYPAL_LINK = "";
+// export const PAYPAL_LINK = "stegaglia17@gmail.com";
+export const SATISPAY_LINK = "https://tag.satispay.com/stefanogagliardi95";
