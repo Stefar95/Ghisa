@@ -31,7 +31,7 @@ export default function InfoModal({ isAdmin, onClose }) {
           Ideata da <span style={{ color: "var(--ink)", fontWeight: 600 }}>Stefano</span>.
         </p>
 
-        {isAdmin && (
+        {(
           <div className="g-donate-box">
             <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
               <Heart size={15} color="var(--accent)" />

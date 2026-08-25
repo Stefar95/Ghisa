@@ -1,14 +1,16 @@
 import { useState, useRef } from "react";
 import { Lock } from "lucide-react";
+import { SEARCH_MIN_CHARS } from "../lib/utils";
 
 export default function ExercisePicker({ exercises, value, onChange, placeholder, locked }) {
   const [open, setOpen] = useState(false);
   const wrapRef = useRef(null);
 
   const query = value || "";
-  const matches = exercises
-    .filter((e) => e.toLowerCase().includes(query.toLowerCase()))
-    .slice(0, 6);
+  const searching = query.trim().length >= SEARCH_MIN_CHARS;
+  const matches = searching
+    ? exercises.filter((e) => e.toLowerCase().includes(query.toLowerCase())).slice(0, 6)
+    : [];
   const exactMatch = exercises.some((e) => e.toLowerCase() === query.trim().toLowerCase());
 
   if (locked) {
@@ -35,30 +37,33 @@ export default function ExercisePicker({ exercises, value, onChange, placeholder
       />
       {open && (
         <div className="g-autocomplete-list">
-          {matches.map((m) => (
-            <div
-              key={m}
-              className="g-autocomplete-item"
-              onMouseDown={() => {
-                onChange(m);
-                setOpen(false);
-              }}
-            >
-              {m}
-            </div>
-          ))}
-          {query.trim() && !exactMatch && (
-            <div
-              className="g-autocomplete-item g-autocomplete-new"
-              onMouseDown={() => setOpen(false)}
-            >
-              Non lo trovi? Inserisci: "{query.trim()}"
-            </div>
-          )}
-          {matches.length === 0 && !query.trim() && (
+          {!searching ? (
             <div className="g-autocomplete-item" style={{ color: "var(--ink-dim)", cursor: "default" }}>
-              Scrivi per cercare o aggiungere un esercizio
+              Scrivi almeno {SEARCH_MIN_CHARS} lettere per cercare o aggiungere un esercizio
             </div>
+          ) : (
+            <>
+              {matches.map((m) => (
+                <div
+                  key={m}
+                  className="g-autocomplete-item"
+                  onMouseDown={() => {
+                    onChange(m);
+                    setOpen(false);
+                  }}
+                >
+                  {m}
+                </div>
+              ))}
+              {!exactMatch && (
+                <div
+                  className="g-autocomplete-item g-autocomplete-new"
+                  onMouseDown={() => setOpen(false)}
+                >
+                  Non lo trovi? Inserisci: "{query.trim()}"
+                </div>
+              )}
+            </>
           )}
         </div>
       )}

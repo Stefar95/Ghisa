@@ -15,11 +15,71 @@ import {
 import {
   uid, confirmThen, todayISO, formatDate, formatMMSS, STEPS,
   getReps, getBackoffReps, getBackoffPercent, repsLabel,
-  getExType, isTimeBased, isAmrap, logSummary,
-  flattenSteps, restAfterPart, getCombo, comboLabel, getParts, partAmountLabel, dayOptions, getDays,
+  getExType, isDurationBased, isAmrap, logSummary, EX_TYPES, defaultDuration,
+  flattenSteps, restAfterPart, getCombo, comboLabel, getParts, partAmountLabel,
+  dayOptions, getDays, startAlarm, JUMPSET_REST,
 } from "../lib/utils";
 import BodyDiagram from "./BodyDiagram";
 import ExercisePicker from "./ExercisePicker";
+import DurationField from "./DurationField";
+
+// Timer compatto per la pausa tra gli esercizi di un jumpset
+function MiniTimer({ seconds }) {
+  const [left, setLeft] = useState(seconds);
+  const [running, setRunning] = useState(false);
+  const [ringing, setRinging] = useState(false);
+  const stopRef = useRef(null);
+
+  useEffect(() => {
+    setLeft(seconds);
+    setRunning(false);
+  }, [seconds]);
+
+  useEffect(() => {
+    if (!running) return;
+    const id = setInterval(() => {
+      setLeft((l) => {
+        if (l <= 1) {
+          setRunning(false);
+          stopRef.current = startAlarm();
+          setRinging(true);
+          return 0;
+        }
+        return l - 1;
+      });
+    }, 1000);
+    return () => clearInterval(id);
+  }, [running]);
+
+  useEffect(() => () => { if (stopRef.current) stopRef.current(); }, []);
+
+  const stopAll = () => {
+    if (stopRef.current) stopRef.current();
+    stopRef.current = null;
+    setRinging(false);
+    setLeft(seconds);
+    setRunning(false);
+  };
+
+  return (
+    <div className="g-mini-timer">
+      <span className="g-mini-timer-label">Pausa</span>
+      <span className="g-mini-timer-value ghisa-mono">{formatMMSS(left)}</span>
+      {ringing ? (
+        <button className="g-mini-timer-btn active" onClick={stopAll}>Ferma</button>
+      ) : (
+        <>
+          <button className="g-mini-timer-btn" onClick={() => setRunning((r) => !r)}>
+            {running ? <Pause size={13} /> : <Play size={13} />}
+          </button>
+          <button className="g-mini-timer-btn" onClick={stopAll}>
+            <RotateCcw size={13} />
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
 
 export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBatch, onDelete, onDeleteBatch, onUpdate, draft, onSaveDraft, activeSchedaId }) {
   const [dayId, setDayId] = useState(() => (draft ? draft.dayId : null));
@@ -33,18 +93,55 @@ export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBa
   const [sets, setSets] = useState(3);
   const [reps, setReps] = useState(10);
   const [isBackoff, setIsBackoff] = useState(false);
+  // Giorno libero: tipo di esercizio (ripetizioni/a tempo/a sfinimento/cardio),
+  // come in scheda, ma scelto lì per lì
+  const [freeType, setFreeType] = useState("reps");
+  const [freeNoWeight, setFreeNoWeight] = useState(false);
+  const [freeWarmup, setFreeWarmup] = useState(false);
+  // Anche in giorno libero si può fare "serie diverse" (carico/reps riga per riga),
+  // come per gli esercizi di scheda
+  const [freeUniform, setFreeUniform] = useState(true);
+  const [freeSetRows, setFreeSetRows] = useState([]);
   // Serie uniformi (stesso carico e ripetizioni) oppure una riga per serie
-  const [uniform, setUniform] = useState(true);
-  const [setRows, setSetRows] = useState([]);
+  // Valori compilati per ciascun esercizio del blocco
+  const [partVals, setPartVals] = useState([]);
+  const [backoffPhase, setBackoffPhase] = useState(false);
+  const [timerMode, setTimerMode] = useState("rest"); // 'rest' | 'exercise' 
   const [date, setDate] = useState(() => (draft ? draft.date : todayISO()));
   const [sessionNote, setSessionNote] = useState(() => (draft ? draft.note || "" : ""));
   const [timerRemaining, setTimerRemaining] = useState(0);
   const [timerRunning, setTimerRunning] = useState(false);
-  const [timerMode, setTimerMode] = useState("rest"); // 'rest' | 'exercise' 
   const [expanded, setExpanded] = useState(() => new Set());
   const [editingId, setEditingId] = useState(null);
   const [editDraft, setEditDraft] = useState(null);
+  // Modifica di un esercizio già aggiunto alla sessione in corso (non ancora salvata)
+  const [editingSessionId, setEditingSessionId] = useState(null);
+  const [sessionEditDraft, setSessionEditDraft] = useState(null);
   const isFirstRender = useRef(true);
+  const alarmStopRef = useRef(null);
+  const durationRef = useRef(0); // durata corrente del timer, per il riarmo
+  const [alarmOn, setAlarmOn] = useState(false);
+
+  // Ferma la suoneria e rimette il timer pronto per la serie successiva,
+  // così non serve premere Reset a mano.
+  const stopAlarm = () => {
+    if (alarmStopRef.current) alarmStopRef.current();
+    alarmStopRef.current = null;
+    setAlarmOn(false);
+    setTimerRemaining(durationRef.current);
+    setTimerRunning(false);
+  };
+  useEffect(() => () => { if (alarmStopRef.current) alarmStopRef.current(); }, []);
+  useEffect(() => {
+    if (!alarmOn) return;
+    // Se non la fermi tu, dopo 10 secondi tace e il timer si riarma comunque
+    const t = setTimeout(() => {
+      alarmStopRef.current = null;
+      setAlarmOn(false);
+      setTimerRemaining(durationRef.current);
+    }, 10000);
+    return () => clearTimeout(t);
+  }, [alarmOn]);
   const [completed, setCompleted] = useState(false);
   const [showBodyDiagram, setShowBodyDiagram] = useState(false);
 
@@ -95,29 +192,37 @@ export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBa
   const dayName = selectedOption ? selectedOption.label : dayId === "libero" ? "Giorno libero" : "";
   // Ogni riga di scheda può contenere più esercizi (superset/jumpset):
   // qui li appiattiamo per poterli percorrere uno alla volta.
-  const steps = useMemo(
-    () => (selectedScheda ? flattenSteps(selectedScheda.items) : []),
+  const blocks = useMemo(
+    () => (selectedScheda ? selectedScheda.items || [] : []),
     [selectedScheda]
   );
-  const totalSteps = steps.length;
-  const currentStep = steps[stepIdx] || null;
-  const currentBlock = currentStep?.item || null;   // la riga della scheda
-  const currentItem = currentStep?.part || null;    // il singolo esercizio
-  const combo = currentBlock ? getCombo(currentBlock) : "none";
+  const totalSteps = blocks.length;
+  const currentBlock = blocks[stepIdx] || null;
   const blockParts = currentBlock ? getParts(currentBlock) : [];
-  const restInfo = currentBlock
-    ? restAfterPart(currentBlock, currentStep.partIdx)
-    : { seconds: 0, kind: "rest" };
-  const currentRest = restInfo.seconds;
-  // Tipo di esercizio: in "giorno libero" resta sempre a ripetizioni con carico
-  const exType = currentItem ? getExType(currentItem) : "reps";
-  const noWeight = currentItem ? !!currentItem.noWeight : false;
+  const combo = currentBlock ? getCombo(currentBlock) : "none";
+  const currentRest = currentBlock ? currentBlock.restSeconds || 0 : 0;
+
+  // Nella fase back-off restano solo gli esercizi che ne prevedono uno
+  const activeParts = useMemo(() => {
+    const list = blockParts.map((p, i) => ({ part: p, idx: i }));
+    return backoffPhase ? list.filter((x) => x.part.backoffSets > 0) : list;
+  }, [currentBlock, backoffPhase]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Il primo esercizio del blocco guida timer e riepiloghi; in "giorno libero"
+  // non c'è uno step di scheda, quindi il tipo lo scelgo lì per lì (freeType)
+  const currentItem = activeParts[0]?.part || null;
+  const exType = selectedScheda ? (currentItem ? getExType(currentItem) : "reps") : freeType;
+  const noWeight = selectedScheda ? (currentItem ? !!currentItem.noWeight : false) : freeNoWeight;
   const timeBased = exType === "time";
+  const cardio = exType === "cardio";
   const amrap = exType === "amrap";
-  const amountStep = timeBased ? 5 : 1;
-  // Il timer cronometra il recupero, oppure la durata dell'esercizio se è a tempo
-  const activeTimerMode = timeBased ? (currentRest > 0 ? timerMode : "exercise") : "rest";
-  const activeTimerDuration = activeTimerMode === "exercise" ? reps || 0 : currentRest;
+  const amountStep = timeBased || cardio ? 15 : 1;
+  // Il timer cronometra il recupero, oppure la durata dell'esercizio se è a tempo/cardio
+  const activeTimerMode = timeBased || cardio ? (currentRest > 0 ? timerMode : "exercise") : "rest";
+  const activeTimerDuration =
+    activeTimerMode === "exercise"
+      ? (selectedScheda ? partVals[activeParts[0]?.idx]?.reps || 0 : reps || 0)
+      : currentRest;
 
   // Al primo render non azzerare lo step se stiamo ripristinando una bozza sospesa
   useEffect(() => {
@@ -163,26 +268,35 @@ export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBa
     });
   };
 
+  // Ultimo carico usato per un esercizio (solo top set con carico)
+  const ultimoPeso = (nome) => {
+    const prec = logs
+      .filter((l) => l.exercise === nome && !l.backoff && !l.noWeight)
+      .sort((a, b) => (a.id < b.id ? 1 : -1));
+    return prec.length ? prec[0].weight : 20;
+  };
+
+  // Precompila i valori di tutti gli esercizi del blocco
   useEffect(() => {
-    if (selectedScheda) {
-      const item = steps[stepIdx];
-      if (item) {
-        setExerciseInput(item.part.exercise);
-        setSets(item.item.sets);
-        // A sfinimento: partiamo da 0, le ripetizioni le segni tu a fine serie
-        setReps(getExType(item.part) === "amrap" ? 0 : getReps(item.part).max);
-        setIsBackoff(false);
-        setUniform(true);
-        setSetRows([]);
-      }
-    } else {
-      setExerciseInput("");
-    }
+    if (!currentBlock) return;
+    setBackoffPhase(false);
+    setPartVals(
+      getParts(currentBlock).map((p) => ({
+        weight: p.noWeight ? 0 : ultimoPeso(p.exercise),
+        reps: getExType(p) === "amrap" ? 0 : getReps(p).max,
+        sets: currentBlock.sets,
+        uniform: true,
+        setRows: [],
+      }))
+    );
     // NB: non includere selectedScheda tra le dipendenze — arriva un nuovo
-    // oggetto (stesso contenuto) ad ogni sync col cloud, e farebbe resettare
-    // il form (compreso il back-off appena impostato) senza che l'utente
-    // abbia davvero cambiato giorno o esercizio.
+    // oggetto (stesso contenuto) ad ogni sync col cloud e resetterebbe il form.
   }, [dayId, stepIdx]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // In giorno libero il campo esercizio resta libero
+  useEffect(() => {
+    if (!selectedScheda) setExerciseInput("");
+  }, [dayId, selectedScheda]);
 
   useEffect(() => {
     if (noWeight) return; // esercizio a corpo libero: il carico non serve
@@ -194,8 +308,12 @@ export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBa
   }, [exerciseInput]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
-    setTimerMode(isTimeBased(currentItem) ? "exercise" : "rest");
-  }, [dayId, stepIdx]); // eslint-disable-line react-hooks/exhaustive-deps
+    setTimerMode((selectedScheda ? isDurationBased(currentItem) : timeBased || cardio) ? "exercise" : "rest");
+  }, [dayId, stepIdx, freeType]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    durationRef.current = activeTimerDuration;
+  }, [activeTimerDuration]);
 
   useEffect(() => {
     setTimerRemaining(activeTimerDuration);
@@ -208,6 +326,9 @@ export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBa
       setTimerRemaining((r) => {
         if (r <= 1) {
           setTimerRunning(false);
+          // La suoneria continua finché non la fermi (o per 10 secondi)
+          alarmStopRef.current = startAlarm();
+          setAlarmOn(true);
           return 0;
         }
         return r - 1;
@@ -230,95 +351,216 @@ export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBa
     if (selectedScheda && stepIdx < totalSteps - 1) setStepIdx((i) => i + 1);
   };
 
-  // Passa da "serie tutte uguali" a "una riga per serie" e viceversa
-  const toggleUniform = (nextUniform) => {
-    if (!nextUniform) {
-      setSetRows(
-        Array.from({ length: Math.max(1, sets) }, () => ({
-          weight: noWeight ? 0 : weight,
-          reps,
-        }))
-      );
+  // --- valori dei singoli esercizi del blocco ---
+  const updatePart = (idx, patch) =>
+    setPartVals((prev) => prev.map((v, i) => (i === idx ? { ...v, ...patch } : v)));
+
+  const toggleUniform = (idx, nextUniform) =>
+    setPartVals((prev) =>
+      prev.map((v, i) => {
+        if (i !== idx) return v;
+        if (nextUniform) return { ...v, uniform: true };
+        return {
+          ...v,
+          uniform: false,
+          setRows: Array.from({ length: Math.max(1, v.sets) }, () => ({
+            weight: v.weight,
+            reps: v.reps,
+          })),
+        };
+      })
+    );
+
+  const updateSetRow = (idx, j, patch) =>
+    setPartVals((prev) =>
+      prev.map((v, i) =>
+        i === idx ? { ...v, setRows: v.setRows.map((r, k) => (k === j ? { ...r, ...patch } : r)) } : v
+      )
+    );
+
+  const addSetRow = (idx) =>
+    setPartVals((prev) =>
+      prev.map((v, i) =>
+        i === idx
+          ? { ...v, setRows: [...v.setRows, { ...(v.setRows[v.setRows.length - 1] || { weight: v.weight, reps: v.reps }) }] }
+          : v
+      )
+    );
+
+  const removeSetRow = (idx, j) =>
+    setPartVals((prev) =>
+      prev.map((v, i) => (i === idx ? { ...v, setRows: v.setRows.filter((_, k) => k !== j) } : v))
+    );
+
+  // --- "serie diverse" per l'esercizio di giorno libero ---
+  const toggleFreeUniform = (nextUniform) => {
+    if (nextUniform) {
+      setFreeUniform(true);
+    } else {
+      setFreeUniform(false);
+      setFreeSetRows(Array.from({ length: Math.max(1, sets) }, () => ({ weight, reps })));
     }
-    setUniform(nextUniform);
   };
+  const updateFreeSetRow = (j, patch) =>
+    setFreeSetRows((prev) => prev.map((r, k) => (k === j ? { ...r, ...patch } : r)));
+  const addFreeSetRow = () =>
+    setFreeSetRows((prev) => [...prev, { ...(prev[prev.length - 1] || { weight, reps }) }]);
+  const removeFreeSetRow = (j) =>
+    setFreeSetRows((prev) => prev.filter((_, k) => k !== j));
 
-  const updateSetRow = (i, patch) =>
-    setSetRows((prev) => prev.map((r, idx) => (idx === i ? { ...r, ...patch } : r)));
-
-  const addSetRow = () =>
-    setSetRows((prev) => [...prev, { ...(prev[prev.length - 1] || { weight, reps }) }]);
-
-  const removeSetRow = (i) => setSetRows((prev) => prev.filter((_, idx) => idx !== i));
-
-  const addToSession = () => {
-    if (!exerciseInput.trim()) return;
-
-    // Serie differenziate: salvo il dettaglio riga per riga e uso come valore
-    // di riferimento la serie più pesante (o la migliore, se a corpo libero)
-    let entry;
-    if (!uniform && setRows.length) {
-      const rows = setRows.map((r) => ({
-        weight: noWeight ? 0 : Number(r.weight) || 0,
+  const buildEntry = (part, v) => {
+    const senzaCarico = !!part.noWeight;
+    const base = {
+      tempId: uid(),
+      exercise: part.exercise,
+      backoff: backoffPhase,
+      type: getExType(part),
+      noWeight: senzaCarico,
+      warmup: !!currentBlock?.warmup,
+    };
+    if (!v.uniform && v.setRows.length) {
+      const righe = v.setRows.map((r) => ({
+        weight: senzaCarico ? 0 : Number(r.weight) || 0,
         reps: Number(r.reps) || 0,
       }));
-      const best = rows.reduce(
-        (acc, r) => (noWeight ? (r.reps > acc.reps ? r : acc) : r.weight > acc.weight ? r : acc),
-        rows[0]
+      const best = righe.reduce(
+        (acc, r) => (senzaCarico ? (r.reps > acc.reps ? r : acc) : r.weight > acc.weight ? r : acc),
+        righe[0]
       );
-      entry = {
-        tempId: uid(),
-        exercise: exerciseInput.trim(),
-        weight: best.weight,
-        sets: rows.length,
-        reps: best.reps,
-        setDetails: rows,
-        backoff: isBackoff,
-        type: exType,
-        noWeight,
-        warmup: !!currentBlock?.warmup,
-      };
-    } else {
-      entry = {
-        tempId: uid(),
-        exercise: exerciseInput.trim(),
-        weight: noWeight ? 0 : weight,
-        sets,
-        reps,
-        backoff: isBackoff,
-        type: exType,
-        noWeight,
-        warmup: !!currentBlock?.warmup,
-      };
+      return { ...base, weight: best.weight, sets: righe.length, reps: best.reps, setDetails: righe };
     }
+    return {
+      ...base,
+      weight: senzaCarico ? 0 : Number(v.weight) || 0,
+      sets: Number(v.sets) || 1,
+      reps: Number(v.reps) || 0,
+    };
+  };
 
-    setSession((prev) => [...prev, entry]);
-    setUniform(true);
-    setSetRows([]);
-
-    if (currentItem && currentItem.backoffSets > 0 && !isBackoff) {
-      // Appena aggiunto il top set: proponi subito il back-off dello stesso esercizio,
-      // con peso ridotto della percentuale impostata per questo esercizio (arrotondato per eccesso)
-      const pct = getBackoffPercent(currentItem);
-      const base = entry.weight || weight;
-      setIsBackoff(true);
-      setSets(currentItem.backoffSets);
-      setReps(getBackoffReps(currentItem).max);
-      setWeight(Math.ceil(base * (1 - pct / 100)));
-    } else if (selectedScheda) {
-      if (stepIdx < totalSteps - 1) {
-        goNext();
+  const addToSession = () => {
+    // Giorno libero: un esercizio scritto a mano, con tipo scelto lì per lì
+    if (!selectedScheda) {
+      if (!exerciseInput.trim()) return;
+      const boAllowed = freeType !== "amrap" && freeType !== "cardio" && !freeNoWeight;
+      const base = {
+        tempId: uid(),
+        exercise: exerciseInput.trim(),
+        backoff: boAllowed && isBackoff,
+        type: freeType,
+        noWeight: freeNoWeight,
+        warmup: freeWarmup,
+      };
+      let entry;
+      if (!freeUniform && freeSetRows.length) {
+        const righe = freeSetRows.map((r) => ({
+          weight: freeNoWeight ? 0 : Number(r.weight) || 0,
+          reps: Number(r.reps) || 0,
+        }));
+        const best = righe.reduce(
+          (acc, r) => (freeNoWeight ? (r.reps > acc.reps ? r : acc) : r.weight > acc.weight ? r : acc),
+          righe[0]
+        );
+        entry = { ...base, weight: best.weight, sets: righe.length, reps: best.reps, setDetails: righe };
       } else {
-        setCompleted(true);
+        entry = {
+          ...base,
+          weight: freeNoWeight ? 0 : weight,
+          sets: freeType === "cardio" ? 1 : sets,
+          reps,
+        };
       }
-    } else {
+      setSession((prev) => [...prev, entry]);
       setExerciseInput("");
       setIsBackoff(false);
+      setFreeType("reps");
+      setFreeNoWeight(false);
+      setFreeWarmup(false);
+      setFreeUniform(true);
+      setFreeSetRows([]);
+      return;
+    }
+
+    // Registro in un colpo solo tutti gli esercizi del blocco
+    const entries = activeParts.map((x) => buildEntry(x.part, partVals[x.idx] || {}));
+    if (!entries.length) return;
+    setSession((prev) => [...prev, ...entries]);
+
+    const conBackoff = blockParts.some((p) => p.backoffSets > 0);
+    if (!backoffPhase && conBackoff) {
+      // Seconda fase: gli stessi esercizi a carico ridotto
+      setBackoffPhase(true);
+      setPartVals((prev) =>
+        blockParts.map((p, i) => {
+          if (p.backoffSets <= 0) return prev[i];
+          const base = prev[i]?.weight || 0;
+          return {
+            weight: p.noWeight ? 0 : Math.ceil(base * (1 - getBackoffPercent(p) / 100)),
+            reps: getBackoffReps(p).max,
+            sets: p.backoffSets,
+            uniform: true,
+            setRows: [],
+          };
+        })
+      );
+      return;
+    }
+
+    if (stepIdx < totalSteps - 1) {
+      goNext();
+    } else {
+      setCompleted(true);
     }
   };
 
   const removeFromSession = (tempId) => {
     setSession((prev) => prev.filter((e) => e.tempId !== tempId));
+  };
+
+  // Modifica (compreso il nome dell'esercizio) di una riga già aggiunta alla
+  // sessione in corso, prima di salvarla
+  const startEditSession = (e) => {
+    setEditingSessionId(e.tempId);
+    setSessionEditDraft({
+      exercise: e.exercise,
+      weight: e.weight,
+      sets: e.sets,
+      reps: e.reps,
+      backoff: !!e.backoff,
+      type: e.type || "reps",
+      noWeight: !!e.noWeight,
+      warmup: !!e.warmup,
+    });
+  };
+
+  const cancelEditSession = () => {
+    setEditingSessionId(null);
+    setSessionEditDraft(null);
+  };
+
+  const saveEditSession = () => {
+    if (!editingSessionId || !sessionEditDraft || !sessionEditDraft.exercise.trim()) return;
+    const d = sessionEditDraft;
+    const boAllowed = d.type !== "amrap" && d.type !== "cardio" && !d.noWeight;
+    setSession((prev) =>
+      prev.map((e) =>
+        e.tempId === editingSessionId
+          ? {
+              ...e,
+              exercise: d.exercise.trim(),
+              weight: d.noWeight ? 0 : Number(d.weight) || 0,
+              sets: d.type === "cardio" ? 1 : Number(d.sets) || 1,
+              reps: Number(d.reps) || 0,
+              backoff: boAllowed && d.backoff,
+              type: d.type,
+              noWeight: d.noWeight,
+              warmup: d.warmup,
+              setDetails: null,
+            }
+          : e
+      )
+    );
+    setEditingSessionId(null);
+    setSessionEditDraft(null);
   };
 
   const saveSession = () => {
@@ -552,275 +794,436 @@ export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBa
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div className="g-ex-meta">
                   Esercizio {stepIdx + 1}/{totalSteps}
-                  {(exerciseMeta[currentItem?.exercise] || []).length > 0 && (
-                    <>
-                      {" · "}
-                      <button
-                        className="g-parts-link"
-                        onClick={() => setShowBodyDiagram((v) => !v)}
-                      >
-                        {(exerciseMeta[currentItem.exercise] || []).join(", ")}
-                        {showBodyDiagram ? " ▲" : " ▼"}
-                      </button>
-                    </>
-                  )}
+                  {combo !== "none" && <span className="g-combo-label"> · {comboLabel(combo)}</span>}
+                  {backoffPhase && <span style={{ color: "var(--steel)" }}> · back-off</span>}
                 </div>
-                <div className="g-ex-name">{exerciseInput}</div>
+                <div className="g-ex-name">{blockParts.map((p) => p.exercise).join(" + ")}</div>
                 <div className="g-ex-tags">
-                  <span className="g-tag g-tag-target">
-                    {currentBlock.sets}x{partAmountLabel(currentItem)}
-                  </span>
-                  {combo !== "none" && (
+                  {currentBlock?.warmup && <span className="g-tag g-tag-warm">Riscaldamento</span>}
+                  {combo === "jumpset" && (
                     <span className="g-tag g-tag-link">
-                      {comboLabel(combo)} {currentStep.partIdx + 1}/{blockParts.length}
+                      {formatMMSS(currentBlock?.jumpsetRestSeconds ?? JUMPSET_REST)} tra gli esercizi
                     </span>
                   )}
-                  {currentBlock?.warmup && <span className="g-tag g-tag-warm">Riscaldamento</span>}
-                  {noWeight && <span className="g-tag">Corpo libero</span>}
-                  {amrap && <span className="g-tag">A sfinimento</span>}
+                  {combo === "superset" && <span className="g-tag g-tag-link">Senza pausa</span>}
                 </div>
               </div>
               <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
                 <button className="g-icon-btn" onClick={goPrev} disabled={stepIdx === 0}>
                   <ChevronLeft size={15} />
                 </button>
-                <button
-                  className="g-icon-btn"
-                  onClick={goNext}
-                  disabled={stepIdx === totalSteps - 1}
-                >
+                <button className="g-icon-btn" onClick={goNext} disabled={stepIdx === totalSteps - 1}>
                   <ChevronRight size={15} />
                 </button>
               </div>
             </div>
-            {currentBlock?.note && (
-              <div className="g-ex-note">{currentBlock.note}</div>
-            )}
-            {restInfo.kind === "superset" && (
-              <div className="g-ex-note g-ex-note-link">
-                Superset: subito dopo → {restInfo.nextExercise}
-              </div>
-            )}
-            {showBodyDiagram && (exerciseMeta[currentItem?.exercise] || []).length > 0 && (
-              <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px solid var(--line)" }}>
-                <BodyDiagram selected={exerciseMeta[currentItem.exercise] || []} size={64} />
-              </div>
-            )}
+
+            {currentBlock?.note && <div className="g-ex-note">{currentBlock.note}</div>}
+
+            {activeParts.map((x, k) => {
+              const part = x.part;
+              const v = partVals[x.idx] || { weight: 0, reps: 0, sets: 1, uniform: true, setRows: [] };
+              const t = getExType(part);
+              const senzaCarico = !!part.noWeight;
+              const aTempo = t === "time";
+              const aCardio = t === "cardio";
+              const aSfinimento = t === "amrap";
+              const passo = aTempo ? 15 : 1;
+              const q = backoffPhase ? getBackoffReps(part) : getReps(part);
+              const nSerie = backoffPhase ? part.backoffSets : currentBlock.sets;
+              const parti = exerciseMeta[part.exercise] || [];
+              const multiplo = blockParts.length > 1;
+
+              return (
+                <div key={x.idx}>
+                  {k > 0 && (
+                    combo === "jumpset" ? (
+                      <MiniTimer seconds={currentBlock.jumpsetRestSeconds ?? JUMPSET_REST} />
+                    ) : (
+                      <div className="g-combo-arrow">↓  subito dopo, senza pausa</div>
+                    )
+                  )}
+                  <div className={multiplo ? "g-part-block" : ""}>
+                    {multiplo && (
+                      <div className="g-part-block-head">
+                        <span className="g-part-block-name">{part.exercise}</span>
+                        <span className="g-tag g-tag-target">
+                          {aCardio ? formatMMSS(q.max) : `${nSerie}x${repsLabel(q.min, q.max)}${aTempo ? "s" : ""}`}
+                        </span>
+                      </div>
+                    )}
+                    {!multiplo && (
+                      <div className="g-ex-tags" style={{ marginTop: 0, marginBottom: 4 }}>
+                        <span className="g-tag g-tag-target">
+                          {aCardio ? formatMMSS(q.max) : `${nSerie}x${repsLabel(q.min, q.max)}${aTempo ? "s" : ""}`}
+                        </span>
+                        {parti.length > 0 && (
+                          <button className="g-parts-link g-tag" onClick={() => setShowBodyDiagram((b) => !b)}>
+                            {parti.join(", ")}{showBodyDiagram ? " ▲" : " ▼"}
+                          </button>
+                        )}
+                        {senzaCarico && <span className="g-tag">Corpo libero</span>}
+                        {aSfinimento && <span className="g-tag">A sfinimento</span>}
+                        {aCardio && <span className="g-tag">Cardio</span>}
+                      </div>
+                    )}
+
+                    {!multiplo && showBodyDiagram && parti.length > 0 && (
+                      <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px solid var(--line)" }}>
+                        <BodyDiagram selected={parti} size={64} />
+                      </div>
+                    )}
+
+                    {!aCardio && (
+                      <div className="g-seg" style={{ marginTop: 12 }}>
+                        <button className={`g-seg-btn ${v.uniform ? "active" : ""}`} onClick={() => toggleUniform(x.idx, true)}>
+                          Serie uguali
+                        </button>
+                        <button className={`g-seg-btn ${!v.uniform ? "active" : ""}`} onClick={() => toggleUniform(x.idx, false)}>
+                          Serie diverse
+                        </button>
+                      </div>
+                    )}
+
+                    {aCardio ? (
+                      <>
+                        {!senzaCarico && (
+                          <div style={{ marginTop: 16 }}>
+                            <label className="g-field-label" style={{ textAlign: "center" }}>Peso</label>
+                            <div className="g-weight-row">
+                              <button className="plate-btn" onClick={() => updatePart(x.idx, { weight: Math.max(0, Math.round((v.weight - weightStep) * 100) / 100) })}>
+                                <Minus size={22} />
+                              </button>
+                              <div className="g-weight-mid">
+                                <input
+                                  className="weight-readout ghisa-mono"
+                                  type="number"
+                                  value={v.weight}
+                                  onChange={(e) => updatePart(x.idx, { weight: parseFloat(e.target.value) || 0 })}
+                                  step="0.5"
+                                />
+                                <div className="weight-unit">KG</div>
+                              </div>
+                              <button className="plate-btn" onClick={() => updatePart(x.idx, { weight: Math.round((v.weight + weightStep) * 100) / 100 })}>
+                                <Plus size={22} />
+                              </button>
+                            </div>
+                            <div className="g-step-row">
+                              {STEPS.map((st) => (
+                                <button key={st} className={`g-step-pill ${weightStep === st ? "active" : ""}`} onClick={() => setWeightStep(st)}>
+                                  ±{st}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                        <div style={{ marginTop: 16 }}>
+                          <label className="g-field-label" style={{ textAlign: "center" }}>Durata</label>
+                          <DurationField value={v.reps} onChange={(secs) => updatePart(x.idx, { reps: secs, sets: 1 })} />
+                        </div>
+                      </>
+                    ) : v.uniform ? (
+                      <>
+                        {!senzaCarico && (
+                          <div style={{ marginTop: 16 }}>
+                            <label className="g-field-label" style={{ textAlign: "center" }}>
+                              Peso
+                              {backoffPhase && (
+                                <span style={{ color: "var(--steel)", fontWeight: 400, textTransform: "none", letterSpacing: 0 }}>
+                                  {" "}(-{getBackoffPercent(part)}%)
+                                </span>
+                              )}
+                            </label>
+                            <div className="g-weight-row">
+                              <button className="plate-btn" onClick={() => updatePart(x.idx, { weight: Math.max(0, Math.round((v.weight - weightStep) * 100) / 100) })}>
+                                <Minus size={22} />
+                              </button>
+                              <div className="g-weight-mid">
+                                <input
+                                  className="weight-readout ghisa-mono"
+                                  type="number"
+                                  value={v.weight}
+                                  onChange={(e) => updatePart(x.idx, { weight: parseFloat(e.target.value) || 0 })}
+                                  step="0.5"
+                                />
+                                <div className="weight-unit">KG</div>
+                              </div>
+                              <button className="plate-btn" onClick={() => updatePart(x.idx, { weight: Math.round((v.weight + weightStep) * 100) / 100 })}>
+                                <Plus size={22} />
+                              </button>
+                            </div>
+                            <div className="g-step-row">
+                              {STEPS.map((st) => (
+                                <button key={st} className={`g-step-pill ${weightStep === st ? "active" : ""}`} onClick={() => setWeightStep(st)}>
+                                  ±{st}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
+                        <div className="g-sets-reps-row">
+                          <div className="g-sets-reps-col">
+                            <label className="g-field-label" style={{ textAlign: "center" }}>Serie</label>
+                            <div className="g-counter">
+                              <button className="g-counter-btn" onClick={() => updatePart(x.idx, { sets: Math.max(1, v.sets - 1) })}>−</button>
+                              <div className="g-counter-num">{v.sets}</div>
+                              <button className="g-counter-btn" onClick={() => updatePart(x.idx, { sets: v.sets + 1 })}>+</button>
+                            </div>
+                          </div>
+                          <div className="g-sets-reps-col">
+                            <label className="g-field-label" style={{ textAlign: "center" }}>
+                              {aTempo ? "Secondi" : aSfinimento ? "Rip. fatte" : "Ripetizioni"}
+                              {!aSfinimento && (
+                                <span style={{ color: "var(--accent)" }}> ({repsLabel(q.min, q.max)}{aTempo ? "s" : ""})</span>
+                              )}
+                            </label>
+                            <div className="g-counter">
+                              <button className="g-counter-btn" onClick={() => updatePart(x.idx, { reps: Math.max(aSfinimento ? 0 : 1, v.reps - passo) })}>−</button>
+                              <div className="g-counter-num">{v.reps}</div>
+                              <button className="g-counter-btn" onClick={() => updatePart(x.idx, { reps: v.reps + passo })}>+</button>
+                            </div>
+                          </div>
+                        </div>
+                      </>
+                    ) : (
+                      <div className="g-sets-wrap">
+                        <div className="g-set-head">
+                          <span className="g-set-num" />
+                          {!senzaCarico && <span className="g-set-col">Peso</span>}
+                          <span className="g-set-col">{aTempo ? "Sec" : "Rip"}</span>
+                          {v.setRows.length > 1 && <span className="g-set-spacer" />}
+                        </div>
+                        {v.setRows.map((r, j) => (
+                          <div className="g-set-row" key={j}>
+                            <span className="g-set-num">{j + 1}ª</span>
+                            {!senzaCarico && (
+                              <input
+                                className="g-input g-set-input ghisa-mono"
+                                type="number"
+                                step="0.5"
+                                value={r.weight}
+                                onChange={(e) => updateSetRow(x.idx, j, { weight: e.target.value })}
+                              />
+                            )}
+                            <input
+                              className="g-input g-set-input ghisa-mono"
+                              type="number"
+                              min="0"
+                              value={r.reps}
+                              onChange={(e) => updateSetRow(x.idx, j, { reps: e.target.value })}
+                            />
+                            {v.setRows.length > 1 && (
+                              <button className="g-del-btn" onClick={() => removeSetRow(x.idx, j)}>
+                                <X size={14} />
+                              </button>
+                            )}
+                          </div>
+                        ))}
+                        <button className="g-icon-btn" style={{ width: "100%", justifyContent: "center", padding: 8, marginTop: 2 }} onClick={() => addSetRow(x.idx)}>
+                          <Plus size={14} /> Aggiungi serie
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
           </>
         ) : (
           <>
             <label className="g-field-label">Esercizio</label>
-            <ExercisePicker
-              exercises={exercises}
-              value={exerciseInput}
-              onChange={setExerciseInput}
-              placeholder=""
-            />
+            <ExercisePicker exercises={exercises} value={exerciseInput} onChange={setExerciseInput} placeholder="" />
+
+            <div className="g-seg" style={{ marginTop: 12 }}>
+              {EX_TYPES.map((t) => (
+                <button
+                  key={t.id}
+                  className={`g-seg-btn ${freeType === t.id ? "active" : ""}`}
+                  onClick={() => {
+                    if (freeType === t.id) return;
+                    // Ripetizioni e durata sono cose distinte: cambiando tipo si
+                    // riparte da un default sensato per quel tipo, invece di
+                    // trascinarsi il numero del tipo precedente.
+                    setFreeType(t.id);
+                    setReps(t.id === "time" || t.id === "cardio" ? defaultDuration(t.id) : 10);
+                    setFreeUniform(true);
+                    setFreeSetRows([]);
+                  }}
+                >
+                  {t.label}
+                </button>
+              ))}
+            </div>
+
+            <label className="g-checkbox-row" style={{ marginTop: 10 }}>
+              <input type="checkbox" checked={freeNoWeight} onChange={(e) => setFreeNoWeight(e.target.checked)} />
+              Senza carico (corpo libero)
+            </label>
+            <label className="g-checkbox-row">
+              <input type="checkbox" checked={freeWarmup} onChange={(e) => setFreeWarmup(e.target.checked)} />
+              Riscaldamento
+            </label>
+
+            {freeType === "cardio" ? (
+              <div style={{ marginTop: 16 }}>
+                <label className="g-field-label" style={{ textAlign: "center" }}>Durata</label>
+                <DurationField value={reps} onChange={setReps} />
+              </div>
+            ) : (
+              <>
+                <div className="g-seg" style={{ marginTop: 12 }}>
+                  <button className={`g-seg-btn ${freeUniform ? "active" : ""}`} onClick={() => toggleFreeUniform(true)}>
+                    Serie uguali
+                  </button>
+                  <button className={`g-seg-btn ${!freeUniform ? "active" : ""}`} onClick={() => toggleFreeUniform(false)}>
+                    Serie diverse
+                  </button>
+                </div>
+
+                {freeUniform ? (
+                  <>
+                    {!freeNoWeight && (
+                      <div style={{ marginTop: 14 }}>
+                        <label className="g-field-label" style={{ textAlign: "center" }}>Peso</label>
+                        <div className="g-weight-row">
+                          <button className="plate-btn" onClick={() => adjust(-weightStep)}><Minus size={22} /></button>
+                          <div className="g-weight-mid">
+                            <input className="weight-readout ghisa-mono" type="number" value={weight}
+                              onChange={(e) => setWeight(parseFloat(e.target.value) || 0)} step="0.5" />
+                            <div className="weight-unit">KG</div>
+                          </div>
+                          <button className="plate-btn" onClick={() => adjust(weightStep)}><Plus size={22} /></button>
+                        </div>
+                        <div className="g-step-row">
+                          {STEPS.map((st) => (
+                            <button key={st} className={`g-step-pill ${weightStep === st ? "active" : ""}`} onClick={() => setWeightStep(st)}>
+                              ±{st}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="g-sets-reps-row">
+                      <div className="g-sets-reps-col">
+                        <label className="g-field-label" style={{ textAlign: "center" }}>Serie</label>
+                        <div className="g-counter">
+                          <button className="g-counter-btn" onClick={() => setSets((x) => Math.max(1, x - 1))}>−</button>
+                          <div className="g-counter-num">{sets}</div>
+                          <button className="g-counter-btn" onClick={() => setSets((x) => x + 1)}>+</button>
+                        </div>
+                      </div>
+                      <div className="g-sets-reps-col">
+                        <label className="g-field-label" style={{ textAlign: "center" }}>
+                          {freeType === "time" ? "Secondi" : freeType === "amrap" ? "Rip. fatte" : "Ripetizioni"}
+                        </label>
+                        {freeType === "time" ? (
+                          <DurationField value={reps} onChange={setReps} />
+                        ) : (
+                          <div className="g-counter">
+                            <button className="g-counter-btn" onClick={() => setReps((x) => Math.max(freeType === "amrap" ? 0 : 1, x - 1))}>−</button>
+                            <div className="g-counter-num">{reps}</div>
+                            <button className="g-counter-btn" onClick={() => setReps((x) => x + 1)}>+</button>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </>
+                ) : (
+                  <div className="g-sets-wrap">
+                    <div className="g-set-head">
+                      <span className="g-set-num" />
+                      {!freeNoWeight && <span className="g-set-col">Peso</span>}
+                      <span className="g-set-col">{freeType === "time" ? "Sec" : "Rip"}</span>
+                      {freeSetRows.length > 1 && <span className="g-set-spacer" />}
+                    </div>
+                    {freeSetRows.map((r, j) => (
+                      <div className="g-set-row" key={j}>
+                        <span className="g-set-num">{j + 1}ª</span>
+                        {!freeNoWeight && (
+                          <input
+                            className="g-input g-set-input ghisa-mono"
+                            type="number"
+                            step="0.5"
+                            value={r.weight}
+                            onChange={(e) => updateFreeSetRow(j, { weight: e.target.value })}
+                          />
+                        )}
+                        <input
+                          className="g-input g-set-input ghisa-mono"
+                          type="number"
+                          min="0"
+                          value={r.reps}
+                          onChange={(e) => updateFreeSetRow(j, { reps: e.target.value })}
+                        />
+                        {freeSetRows.length > 1 && (
+                          <button className="g-del-btn" onClick={() => removeFreeSetRow(j)}>
+                            <X size={14} />
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                    <button className="g-icon-btn" style={{ width: "100%", justifyContent: "center", padding: 8, marginTop: 2 }} onClick={addFreeSetRow}>
+                      <Plus size={14} /> Aggiungi serie
+                    </button>
+                  </div>
+                )}
+              </>
+            )}
+
+            {freeType !== "amrap" && freeType !== "cardio" && !freeNoWeight && (
+              <div className="g-toggle-row">
+                <button className={`g-toggle-pill ${isBackoff ? "active" : ""}`} onClick={() => setIsBackoff((v) => !v)}>
+                  Serie back-off
+                </button>
+              </div>
+            )}
           </>
         )}
 
-        <div className="g-seg" style={{ marginTop: 18 }}>
-          <button
-            className={`g-seg-btn ${uniform ? "active" : ""}`}
-            onClick={() => toggleUniform(true)}
-          >
-            Serie uguali
-          </button>
-          <button
-            className={`g-seg-btn ${!uniform ? "active" : ""}`}
-            onClick={() => toggleUniform(false)}
-          >
-            Serie diverse
-          </button>
-        </div>
-
-        {!noWeight && uniform && (
-        <div style={{ marginTop: 20 }}>
-          <label className="g-field-label" style={{ textAlign: "center" }}>
-            Peso
-            {isBackoff && currentItem && (
-              <span style={{ color: "var(--steel)", fontWeight: 400, textTransform: "none", letterSpacing: 0 }}>
-                {" "}(-{getBackoffPercent(currentItem)}%)
-              </span>
-            )}
-          </label>
-          <div className="g-weight-row">
-            <button className="plate-btn" onClick={() => adjust(-weightStep)} aria-label="Diminuisci peso">
-              <Minus size={22} />
-            </button>
-            <div className="g-weight-mid">
-              <input
-                className="weight-readout ghisa-mono"
-                type="number"
-                value={weight}
-                onChange={(e) => setWeight(parseFloat(e.target.value) || 0)}
-                step="0.5"
-              />
-              <div className="weight-unit">KG</div>
-            </div>
-            <button className="plate-btn" onClick={() => adjust(weightStep)} aria-label="Aumenta peso">
-              <Plus size={22} />
-            </button>
-          </div>
-          <div className="g-step-row">
-            {STEPS.map((s) => (
-              <button
-                key={s}
-                className={`g-step-pill ${weightStep === s ? "active" : ""}`}
-                onClick={() => setWeightStep(s)}
-              >
-                ±{s}
-              </button>
-            ))}
-          </div>
-        </div>
-        )}
-
-        {uniform ? (
-        <div className="g-sets-reps-row">
-          <div className="g-sets-reps-col">
-            <label className="g-field-label" style={{ textAlign: "center" }}>Serie</label>
-            <div className="g-counter">
-              <button className="g-counter-btn" onClick={() => setSets((s) => Math.max(1, s - 1))}>−</button>
-              <div className="g-counter-num">{sets}</div>
-              <button className="g-counter-btn" onClick={() => setSets((s) => s + 1)}>+</button>
-            </div>
-          </div>
-          <div className="g-sets-reps-col">
-            <label className="g-field-label" style={{ textAlign: "center" }}>
-              {timeBased ? "Secondi" : amrap ? "Rip. fatte" : "Ripetizioni"}
-              {currentItem && !amrap && (() => {
-                const range = isBackoff ? getBackoffReps(currentItem) : getReps(currentItem);
-                return (
-                  <span style={{ color: "var(--accent)" }}>
-                    {" "}({repsLabel(range.min, range.max)}{timeBased ? "s" : ""})
-                  </span>
-                );
-              })()}
-            </label>
-            <div className="g-counter">
-              <button
-                className="g-counter-btn"
-                onClick={() => setReps((r) => Math.max(amrap ? 0 : 1, r - amountStep))}
-              >
-                −
-              </button>
-              <div className="g-counter-num">{reps}</div>
-              <button className="g-counter-btn" onClick={() => setReps((r) => r + amountStep)}>+</button>
-            </div>
-            {amrap && <div className="g-range-badge">Fino a sfinimento</div>}
-          </div>
-        </div>
-        ) : (
-          <div className="g-sets-wrap">
-            <div className="g-field-label" style={{ textAlign: "center" }}>Serie svolte</div>
-            {setRows.map((r, i) => (
-              <div className="g-set-row" key={i}>
-                <span className="g-set-num">{i + 1}ª</span>
-                {!noWeight && (
-                  <>
-                    <input
-                      className="g-input g-set-input ghisa-mono"
-                      type="number"
-                      step="0.5"
-                      value={r.weight}
-                      onChange={(e) => updateSetRow(i, { weight: e.target.value })}
-                    />
-                    <span className="g-set-unit">kg</span>
-                  </>
-                )}
-                <input
-                  className="g-input g-set-input ghisa-mono"
-                  type="number"
-                  min="0"
-                  value={r.reps}
-                  onChange={(e) => updateSetRow(i, { reps: e.target.value })}
-                />
-                <span className="g-set-unit">{timeBased ? "sec" : "rip"}</span>
-                {setRows.length > 1 && (
-                  <button className="g-del-btn" onClick={() => removeSetRow(i)} aria-label="Togli serie">
-                    <X size={14} />
-                  </button>
-                )}
-              </div>
-            ))}
-            <button
-              className="g-icon-btn"
-              style={{ width: "100%", justifyContent: "center", padding: 8, marginTop: 2 }}
-              onClick={addSetRow}
-            >
-              <Plus size={14} /> Aggiungi serie
-            </button>
-          </div>
-        )}
-
-        {!noWeight && !amrap && (
-          <div className="g-toggle-row">
-            <button
-              className={`g-toggle-pill ${isBackoff ? "active" : ""}`}
-              onClick={() => setIsBackoff((v) => !v)}
-            >
-              Serie back-off
-            </button>
-          </div>
-        )}
-
-        {(currentRest > 0 || timeBased) && (
+        {(currentRest > 0 || timeBased || cardio) && (
           <div className="g-timer-box">
             {timeBased && currentRest > 0 && (
               <div className="g-timer-tabs">
-                <button
-                  className={`g-step-pill ${timerMode === "exercise" ? "active" : ""}`}
-                  onClick={() => setTimerMode("exercise")}
-                >
+                <button className={`g-step-pill ${timerMode === "exercise" ? "active" : ""}`} onClick={() => setTimerMode("exercise")}>
                   Esercizio
                 </button>
-                <button
-                  className={`g-step-pill ${timerMode === "rest" ? "active" : ""}`}
-                  onClick={() => setTimerMode("rest")}
-                >
+                <button className={`g-step-pill ${timerMode === "rest" ? "active" : ""}`} onClick={() => setTimerMode("rest")}>
                   Recupero
                 </button>
               </div>
             )}
             <div className="g-timer-label">
-              {activeTimerMode === "exercise"
-                ? "Durata esercizio"
-                : restInfo.kind === "jumpset"
-                ? `Jumpset — 1' poi ${restInfo.nextExercise}`
-                : "Recupero consigliato"}
+              {activeTimerMode === "exercise" ? "Durata esercizio" : "Recupero consigliato"}
             </div>
-            <div
-              className="g-timer-display ghisa-mono"
-              style={timerRemaining === 0 && !timerRunning ? { color: "var(--accent)" } : undefined}
-            >
-              {formatMMSS(timerRemaining)}
-            </div>
+            <div className="g-timer-display ghisa-mono">{formatMMSS(timerRemaining)}</div>
             <div style={{ display: "flex", gap: 8, justifyContent: "center" }}>
-              <button className="g-icon-btn" onClick={() => setTimerRunning((r) => !r)} style={{ gap: 5 }}>
-                {timerRunning ? <Pause size={14} /> : <Play size={14} />}
-                {timerRunning ? "Pausa" : "Avvia"}
-              </button>
-              <button
-                className="g-icon-btn"
-                onClick={() => {
-                  setTimerRemaining(activeTimerDuration);
-                  setTimerRunning(false);
-                }}
-                style={{ gap: 5 }}
-              >
-                <RotateCcw size={14} /> Reset
-              </button>
+              {alarmOn ? (
+                <button className="g-submit" style={{ marginTop: 0, padding: "10px 22px" }} onClick={stopAlarm}>
+                  Ferma suoneria
+                </button>
+              ) : (
+                <>
+                  <button className="g-icon-btn" onClick={() => { stopAlarm(); setTimerRunning((r) => !r); }} style={{ gap: 5 }}>
+                    {timerRunning ? <Pause size={14} /> : <Play size={14} />}
+                    {timerRunning ? "Pausa" : "Avvia"}
+                  </button>
+                  <button className="g-icon-btn" onClick={() => { stopAlarm(); setTimerRemaining(activeTimerDuration); setTimerRunning(false); }} style={{ gap: 5 }}>
+                    <RotateCcw size={14} /> Reset
+                  </button>
+                </>
+              )}
             </div>
           </div>
         )}
 
         <button
           className="g-submit g-submit-secondary"
-          disabled={!exerciseInput.trim()}
+          disabled={selectedScheda ? activeParts.length === 0 : !exerciseInput.trim()}
           onClick={addToSession}
         >
-          + Aggiungi alla sessione
+          {backoffPhase ? "+ Aggiungi back-off alla sessione" : "+ Aggiungi alla sessione"}
         </button>
       </div>
       )}
@@ -833,20 +1236,128 @@ export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBa
           </div>
         ) : (
           <div className="g-card" style={{ padding: "4px 14px" }}>
-            {session.map((e) => (
-              <div className="g-history-row" key={e.tempId}>
-                <div className="g-history-main">
-                  <div className="g-history-ex">
-                    {e.exercise}
-                    {e.backoff && <span style={{ color: "var(--steel)", fontSize: 11 }}> · back-off</span>}
+            {session.map((e) =>
+              editingSessionId === e.tempId ? (
+                <div className="g-edit-row" key={e.tempId}>
+                  <label className="g-field-label">Esercizio</label>
+                  <ExercisePicker
+                    exercises={exercises}
+                    value={sessionEditDraft.exercise}
+                    onChange={(v) => setSessionEditDraft((d) => ({ ...d, exercise: v }))}
+                    placeholder=""
+                  />
+                  <div className="g-seg" style={{ marginTop: 8 }}>
+                    {EX_TYPES.map((t) => (
+                      <button
+                        key={t.id}
+                        className={`g-seg-btn ${sessionEditDraft.type === t.id ? "active" : ""}`}
+                        onClick={() => setSessionEditDraft((d) => ({ ...d, type: t.id }))}
+                      >
+                        {t.label}
+                      </button>
+                    ))}
                   </div>
-                  <div className="g-history-sets">{logSummary(e)}</div>
+                  <label className="g-checkbox-row">
+                    <input
+                      type="checkbox"
+                      checked={sessionEditDraft.noWeight}
+                      onChange={(ev) => setSessionEditDraft((d) => ({ ...d, noWeight: ev.target.checked }))}
+                    />
+                    Senza carico (corpo libero)
+                  </label>
+                  <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                    {!sessionEditDraft.noWeight && (
+                      <div style={{ flex: 1 }}>
+                        <label className="g-field-label">Peso</label>
+                        <input
+                          className="g-input g-num-small"
+                          type="number"
+                          step="0.5"
+                          value={sessionEditDraft.weight}
+                          onChange={(ev) => setSessionEditDraft((d) => ({ ...d, weight: parseFloat(ev.target.value) || 0 }))}
+                        />
+                      </div>
+                    )}
+                    {sessionEditDraft.type !== "cardio" && (
+                      <div style={{ flex: 1 }}>
+                        <label className="g-field-label">Serie</label>
+                        <input
+                          className="g-input g-num-small"
+                          type="number"
+                          min="1"
+                          value={sessionEditDraft.sets}
+                          onChange={(ev) => setSessionEditDraft((d) => ({ ...d, sets: parseInt(ev.target.value) || 1 }))}
+                        />
+                      </div>
+                    )}
+                    <div style={{ flex: 1.4 }}>
+                      <label className="g-field-label">
+                        {sessionEditDraft.type === "time" || sessionEditDraft.type === "cardio"
+                          ? "Durata"
+                          : sessionEditDraft.type === "amrap"
+                          ? "Rip. fatte"
+                          : "Ripetizioni"}
+                      </label>
+                      {sessionEditDraft.type === "time" || sessionEditDraft.type === "cardio" ? (
+                        <DurationField
+                          value={sessionEditDraft.reps}
+                          onChange={(secs) => setSessionEditDraft((d) => ({ ...d, reps: secs }))}
+                        />
+                      ) : (
+                        <input
+                          className="g-input g-num-small"
+                          type="number"
+                          min="0"
+                          value={sessionEditDraft.reps}
+                          onChange={(ev) => setSessionEditDraft((d) => ({ ...d, reps: parseInt(ev.target.value) || 0 }))}
+                        />
+                      )}
+                    </div>
+                  </div>
+                  {sessionEditDraft.type !== "amrap" && sessionEditDraft.type !== "cardio" && !sessionEditDraft.noWeight && (
+                    <label className="g-checkbox-row">
+                      <input
+                        type="checkbox"
+                        checked={sessionEditDraft.backoff}
+                        onChange={(ev) => setSessionEditDraft((d) => ({ ...d, backoff: ev.target.checked }))}
+                      />
+                      Serie back-off
+                    </label>
+                  )}
+                  <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                    <button className="g-icon-btn" style={{ flex: 1, justifyContent: "center" }} onClick={cancelEditSession}>
+                      Annulla
+                    </button>
+                    <button
+                      className="g-submit"
+                      style={{ flex: 1, marginTop: 0 }}
+                      disabled={!sessionEditDraft.exercise.trim()}
+                      onClick={saveEditSession}
+                    >
+                      Salva
+                    </button>
+                  </div>
                 </div>
-                <button className="g-del-btn" onClick={() => removeFromSession(e.tempId)} aria-label="Rimuovi">
-                  <X size={16} />
-                </button>
-              </div>
-            ))}
+              ) : (
+                <div className="g-history-row" key={e.tempId}>
+                  <div className="g-history-main">
+                    <div className="g-history-ex">
+                      {e.exercise}
+                      {e.backoff && <span style={{ color: "var(--steel)", fontSize: 11 }}> · back-off</span>}
+                    </div>
+                    <div className="g-history-sets">{logSummary(e)}</div>
+                  </div>
+                  <div style={{ display: "flex", gap: 2 }}>
+                    <button className="g-del-btn" onClick={() => startEditSession(e)} aria-label="Modifica">
+                      <Pencil size={15} />
+                    </button>
+                    <button className="g-del-btn" onClick={() => removeFromSession(e.tempId)} aria-label="Rimuovi">
+                      <X size={16} />
+                    </button>
+                  </div>
+                </div>
+              )
+            )}
           </div>
         )}
         <button className="g-submit" disabled={session.length === 0} onClick={saveSession} style={{ marginTop: 10 }}>

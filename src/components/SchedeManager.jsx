@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import {
   Trash2, Plus, Pencil, X, FileSpreadsheet, FileDown, Copy, Send, Inbox,
-  CalendarDays, ChevronRight, ChevronDown, MoreVertical, Star, CheckCircle2, UserCheck, Undo2,
+  CalendarDays, ChevronLeft, ChevronRight, ChevronDown, MoreVertical, Star, CheckCircle2, UserCheck, Undo2,
 } from "lucide-react";
 import { uid, confirmThen, getDays, makeDay, blockTitle } from "../lib/utils";
 import { exportSchedaXLSX, exportSchedaPDF } from "../lib/exporters";
@@ -11,7 +11,7 @@ import DuplicateSchedaModal from "./DuplicateSchedaModal";
 
 export default function SchedeManager({
   exercises, exerciseMeta, schede, onAddExercise, onSaveScheda, onDeleteScheda,
-  canAssign, authUser, assignments = [], onAcceptAssignment, onRejectAssignment,
+  canAssign, authUser, assignments = [], onAcceptAssignment, onRejectAssignment, onPushUpdate,
   activeSchedaId, onSetActive,
 }) {
   const [menuFor, setMenuFor] = useState(null);
@@ -108,62 +108,42 @@ export default function SchedeManager({
   const submit = () => {
     if (!name.trim() || days.length === 0) return;
     const totalEx = days.reduce((n, d) => n + (d.items?.length || 0), 0);
-    confirmThen(
-      `Salvare la scheda "${name.trim()}" con ${days.length} ${days.length === 1 ? "giorno" : "giorni"} e ${totalEx} esercizi?`,
-      () => {
-        onSaveScheda({ id: editingId || uid(), name: name.trim(), days });
-        resetForm();
-      }
-    );
+    // Parto dall'originale (se esiste) per non perdere campi come
+    // assignedTo/sourceSchedaId: qui si aggiornano solo nome e giorni.
+    const original = editingId ? schede.find((s) => s.id === editingId) : null;
+    const assignedTargets = original?.assignedTo || [];
+    const pushOnSave = assignedTargets.length > 0 && !!onPushUpdate;
+    const nomiAssegnati = assignedTargets.map((t) => t.name).join(", ");
+    const message = pushOnSave
+      ? `Salvare "${name.trim()}"? La versione aggiornata verrà inviata anche a ${nomiAssegnati}, sovrascrivendo la loro copia (la cronologia resta collegata).`
+      : `Salvare la scheda "${name.trim()}" con ${days.length} ${days.length === 1 ? "giorno" : "giorni"} e ${totalEx} esercizi?`;
+    confirmThen(message, () => {
+      const updated = { ...original, id: editingId || uid(), name: name.trim(), days };
+      onSaveScheda(updated);
+      if (pushOnSave) onPushUpdate(updated);
+      resetForm();
+    });
   };
 
-  return (
-    <div>
-      {assignments.length > 0 && (
-        <div style={{ marginBottom: 16 }}>
-          {assignments.map((a) => (
-            <div className="g-assign-banner" key={a.id}>
-              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <Inbox size={16} />
-                <div>
-                  <div style={{ fontWeight: 600, fontSize: 13.5 }}>{a.scheda?.name}</div>
-                  <div style={{ fontSize: 11.5, color: "var(--ink-dim)" }}>
-                    Assegnata da {a.fromName}
-                  </div>
-                </div>
-              </div>
-              <div style={{ display: "flex", gap: 6 }}>
-                <button className="g-del-btn" onClick={() => onRejectAssignment(a)}>Rifiuta</button>
-                <button className="g-empty-cta" style={{ marginTop: 0, padding: "7px 14px" }}
-                  onClick={() => onAcceptAssignment(a)}>
-                  Aggiungi
-                </button>
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-
-      {!formOpen ? (
-        <button className="g-empty-cta" style={{ width: "100%", marginBottom: 16 }} onClick={startNew}>
-          + Nuova scheda
-        </button>
-      ) : (
-        <div className="g-card" style={{ marginBottom: 16 }}>
+  // Creare/modificare una scheda occupa tutto lo schermo, senza l'elenco
+  // sotto: su telefono è molto più chiaro cosa si sta facendo.
+  if (formOpen) {
+    return (
+      <div>
+        <div className="g-card">
           {openDayIdx === null ? (
             <>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <label className="g-field-label" style={{ marginBottom: 0 }}>
-                  {editingId ? "Modifica scheda" : "Nuova scheda"}
-                </label>
-                <button className="g-icon-btn" onClick={resetForm}><X size={14} /></button>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 4 }}>
+                <button className="g-icon-btn" onClick={resetForm} title="Torna alle schede">
+                  <ChevronLeft size={16} />
+                </button>
+                <input
+                  className="g-input"
+                  placeholder="Nome scheda"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                />
               </div>
-              <input
-                className="g-input"
-                style={{ marginTop: 8 }}
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-              />
 
               <div className="g-field-label" style={{ marginTop: 16 }}>
                 Giorni ({days.length})
@@ -197,11 +177,7 @@ export default function SchedeManager({
                 </div>
               ))}
 
-              <button
-                className="g-icon-btn"
-                style={{ width: "100%", justifyContent: "center", padding: 9, marginTop: 6 }}
-                onClick={addDay}
-              >
+              <button className="g-add-btn" onClick={addDay}>
                 <Plus size={14} /> Aggiungi giorno
               </button>
 
@@ -220,11 +196,44 @@ export default function SchedeManager({
             />
           )}
         </div>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      {assignments.length > 0 && (
+        <div style={{ marginBottom: 16 }}>
+          {assignments.map((a) => (
+            <div className="g-assign-banner" key={a.id}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <Inbox size={16} />
+                <div>
+                  <div style={{ fontWeight: 600, fontSize: 13.5 }}>{a.scheda?.name}</div>
+                  <div style={{ fontSize: 11.5, color: "var(--ink-dim)" }}>
+                    Assegnata da {a.fromName}
+                  </div>
+                </div>
+              </div>
+              <div style={{ display: "flex", gap: 6 }}>
+                <button className="g-del-btn" onClick={() => onRejectAssignment(a)}>Rifiuta</button>
+                <button className="g-empty-cta" style={{ marginTop: 0, padding: "7px 14px" }}
+                  onClick={() => onAcceptAssignment(a)}>
+                  Aggiungi
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
       )}
+
+      <button className="g-empty-cta" style={{ width: "100%", marginBottom: 16 }} onClick={startNew}>
+        + Nuova scheda
+      </button>
 
       <div className="g-field-label">Le tue schede ({mie.length})</div>
       {mie.length === 0 ? (
-        <div className="g-card g-empty" style={{ padding: 24 }}>Nessuna scheda creata ancora.</div>
+        <div className="g-card g-empty" style={{ padding: 24 }}>Nessuna scheda creata</div>
       ) : (
         <div className="g-card" style={{ padding: "4px 14px" }}>
           {mie.map((s) => {
@@ -280,6 +289,7 @@ export default function SchedeManager({
                               <Send size={14} /> Assegna
                             </button>
                           )}
+                          <div className="g-menu-divider" />
                           <button className="g-menu-item" onClick={() => { exportSchedaXLSX(s, exerciseMeta); setMenuFor(null); }}>
                             <FileSpreadsheet size={14} /> Scarica Excel
                           </button>
@@ -289,6 +299,7 @@ export default function SchedeManager({
                           <button className="g-menu-item" onClick={() => { duplicate(s); setMenuFor(null); }}>
                             <Copy size={14} /> Duplica
                           </button>
+                          <div className="g-menu-divider" />
                           <button
                             className="g-menu-item g-menu-danger"
                             onClick={() => { setMenuFor(null); confirmThen(`Eliminare la scheda "${s.name}"?`, () => onDeleteScheda(s.id)); }}
@@ -368,6 +379,7 @@ export default function SchedeManager({
                             <Send size={14} /> Assegna anche a...
                           </button>
                         )}
+                        <div className="g-menu-divider" />
                         <button className="g-menu-item" onClick={() => { exportSchedaXLSX(s, exerciseMeta); setMenuFor(null); }}>
                           <FileSpreadsheet size={14} /> Scarica Excel
                         </button>
@@ -377,6 +389,7 @@ export default function SchedeManager({
                         <button className="g-menu-item" onClick={() => { duplicate(s); setMenuFor(null); }}>
                           <Copy size={14} /> Duplica
                         </button>
+                        <div className="g-menu-divider" />
                         <button className="g-menu-item g-menu-danger"
                           onClick={() => { setMenuFor(null); confirmThen(`Eliminare la scheda "${s.name}"?`, () => onDeleteScheda(s.id)); }}>
                           <Trash2 size={14} /> Elimina

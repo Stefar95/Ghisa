@@ -1,16 +1,32 @@
-import { useState } from "react";
-import { Dumbbell, Trash2, Plus, Pencil, X } from "lucide-react";
-import { confirmThen, BODY_PARTS } from "../lib/utils";
+import { useState, useMemo } from "react";
+import { Dumbbell, Trash2, Plus, Pencil, X, Search, RefreshCw } from "lucide-react";
+import { confirmThen, BODY_PARTS, SEARCH_MIN_CHARS } from "../lib/utils";
 import BodyDiagram from "./BodyDiagram";
 
-export default function ExerciseRegistry({ exercises, exerciseMeta, logs, onAdd, onRemove, onMerge, onRename, onSetBodyParts }) {
+export default function ExerciseRegistry({
+  exercises, exerciseMeta, totalLogCounts = {}, totalsLoading, onRefreshTotals,
+  onAdd, onRemove, onMerge, onRename, onSetBodyParts,
+}) {
   const [name, setName] = useState("");
+  const [search, setSearch] = useState("");
   const [selected, setSelected] = useState([]);
   const [mergeTarget, setMergeTarget] = useState(null);
   const [renamingName, setRenamingName] = useState(null);
   const [renamingValue, setRenamingValue] = useState("");
 
-  const countFor = (ex) => logs.filter((l) => l.exercise === ex).length;
+  // Sempre in ordine alfabetico, e filtrabili con la ricerca
+  const sortedExercises = useMemo(
+    () => [...exercises].sort((a, b) => a.localeCompare(b, "it", { sensitivity: "base" })),
+    [exercises]
+  );
+  const visibleExercises = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (q.length < SEARCH_MIN_CHARS) return sortedExercises;
+    return sortedExercises.filter((ex) => ex.toLowerCase().includes(q));
+  }, [sortedExercises, search]);
+
+  // Totale allenamenti registrati per quell'esercizio, su tutti gli utenti
+  const countFor = (ex) => totalLogCounts[ex] || 0;
 
   const submit = () => {
     if (!name.trim()) return;
@@ -113,16 +129,53 @@ export default function ExerciseRegistry({ exercises, exerciseMeta, logs, onAdd,
 
       <div style={{ marginTop: 16 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <div className="g-field-label">Anagrafica ({exercises.length})</div>
-          {selected.length > 0 && selected.length < 2 && (
-            <div style={{ fontSize: 11, color: "var(--ink-dim)" }}>Selezionane un'altra per unire</div>
-          )}
+          <div className="g-field-label">
+            Anagrafica ({visibleExercises.length}{search.trim().length >= SEARCH_MIN_CHARS ? ` di ${exercises.length}` : ""})
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            {selected.length > 0 && selected.length < 2 && (
+              <div style={{ fontSize: 11, color: "var(--ink-dim)" }}>Selezionane un'altra per unire</div>
+            )}
+            {onRefreshTotals && (
+              <button
+                className="g-icon-btn"
+                style={{ padding: 6 }}
+                onClick={onRefreshTotals}
+                disabled={totalsLoading}
+                title="Aggiorna conteggio allenamenti registrati (tutti gli utenti)"
+              >
+                <RefreshCw size={13} className={totalsLoading ? "g-spin" : ""} />
+              </button>
+            )}
+          </div>
         </div>
+
+        {exercises.length > 0 && (
+          <div className="g-search-field" style={{ marginBottom: 10 }}>
+            <Search size={15} />
+            <input
+              className="g-input"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Cerca esercizio..."
+            />
+            {search && (
+              <button className="g-search-clear" onClick={() => setSearch("")} aria-label="Cancella ricerca">
+                <X size={14} />
+              </button>
+            )}
+          </div>
+        )}
+
         {exercises.length === 0 ? (
           <div className="g-card g-empty" style={{ padding: 24 }}>Nessun esercizio ancora.</div>
+        ) : visibleExercises.length === 0 ? (
+          <div className="g-card g-empty" style={{ padding: 24 }}>
+            Nessun esercizio trovato per "{search.trim()}".
+          </div>
         ) : (
           <div className="g-card" style={{ padding: "4px 14px" }}>
-            {exercises.map((ex) =>
+            {visibleExercises.map((ex) =>
               renamingName === ex ? (
                 <div className="g-reg-row" key={ex} style={{ gap: 8 }}>
                   <input
@@ -153,7 +206,7 @@ export default function ExerciseRegistry({ exercises, exerciseMeta, logs, onAdd,
                       <div>
                         <div className="g-reg-name">{ex}</div>
                         <div className="g-reg-count">
-                          {countFor(ex)} allenamenti registrati
+                          {totalsLoading ? "…" : `${countFor(ex)} allenamenti registrati`}
                           {(exerciseMeta[ex] || []).length > 0 && ` · ${(exerciseMeta[ex] || []).join(", ")}`}
                         </div>
                       </div>

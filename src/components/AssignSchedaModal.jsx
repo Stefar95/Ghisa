@@ -41,6 +41,9 @@ export default function AssignSchedaModal({ scheda, fromUser, onClose, onAssigne
         id,
         toUid: targetUid,
         fromName: fromUser.displayName || fromUser.email,
+        // sourceSchedaId collega la copia all'originale: serve per riconoscere
+        // gli aggiornamenti futuri ("Aggiorna assegnazione")
+        sourceSchedaId: scheda.id,
         scheda: {
           // la copia è indipendente: chi la riceve può modificarla liberamente
           name: scheda.name,

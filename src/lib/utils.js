@@ -1,5 +1,8 @@
 export const STEPS = [0.5, 1.25, 2.5, 5, 10];
 
+// Numero minimo di caratteri prima che una ricerca (esercizi, utenti...) parta
+export const SEARCH_MIN_CHARS = 2;
+
 export const BODY_PARTS = [
   "Petto", "Schiena", "Spalle", "Bicipiti", "Tricipiti",
   "Avambracci", "Gambe", "Glutei", "Polpacci", "Core",
@@ -51,11 +54,13 @@ export function repsLabel(min, max) {
   return min === max ? `${min}` : `${min}-${max}`;
 }
 
-// Tipo di esercizio: a ripetizioni (default), a tempo (plank...), a sfinimento (AMRAP)
+// Tipo di esercizio: a ripetizioni (default), a tempo (plank...), a sfinimento (AMRAP),
+// cardio (cyclette, tapis roulant...: una durata unica, senza serie né recupero)
 export const EX_TYPES = [
   { id: "reps", label: "Ripetizioni" },
   { id: "time", label: "A tempo" },
   { id: "amrap", label: "A sfinimento" },
+  { id: "cardio", label: "Cardio" },
 ];
 
 export function getExType(item) {
@@ -70,6 +75,21 @@ export function isAmrap(item) {
   return getExType(item) === "amrap";
 }
 
+export function isCardio(item) {
+  return getExType(item) === "cardio";
+}
+
+// Esercizi la cui "quantità" per serie è una durata (mm:ss) e non un numero di ripetizioni
+export function isDurationBased(item) {
+  return isTimeBased(item) || isCardio(item);
+}
+
+// Durata di default proposta quando si passa a un tipo a tempo: 30" per un
+// esercizio a tempo (plank...), 10' per un cardio continuo (cyclette...)
+export function defaultDuration(type) {
+  return type === "cardio" ? 600 : 30;
+}
+
 export function hasNoWeight(item) {
   return !!item?.noWeight;
 }
@@ -80,12 +100,13 @@ export function isWarmup(item) {
 
 // Unità della "quantità" per serie: ripetizioni o secondi
 export function amountUnit(item) {
-  return isTimeBased(item) ? "sec" : "rip";
+  return isDurationBased(item) ? "sec" : "rip";
 }
 
-// Etichetta obiettivo di una riga di scheda: "3x5-7", "3x30-45s", "3x max"
+// Etichetta obiettivo di una riga di scheda: "3x5-7", "3x30-45s", "3x max", "20:00" (cardio)
 export function targetLabel(item) {
   const t = getExType(item);
+  if (t === "cardio") return formatMMSS(getReps(item).max);
   if (t === "amrap") return `${item.sets}x max`;
   const { min, max } = getReps(item);
   if (t === "time") return `${item.sets}x ${repsLabel(min, max)}s`;
@@ -96,6 +117,12 @@ export function targetLabel(item) {
 export function logSummary(l) {
   const t = l.type || "reps";
   const unit = t === "time" ? "s" : "";
+
+  // Cardio: durata unica, niente concetto di serie
+  if (t === "cardio") {
+    const durata = formatMMSS(l.reps || 0);
+    return l.noWeight ? durata : `${durata} · ${l.weight} kg`;
+  }
 
   // Serie non uniformi: le elenchiamo una per una (es. "40x10 · 40x10 · 50x8")
   if (Array.isArray(l.setDetails) && l.setDetails.length) {
@@ -112,12 +139,12 @@ export function logSummary(l) {
 
 // --- Blocchi: un elemento di scheda può contenere più esercizi (superset/jumpset) ---
 
-export const JUMPSET_REST = 60; // 1' di pausa tra gli esercizi di un jumpset
+export const JUMPSET_REST = 60; // default: 1' di pausa tra gli esercizi di un jumpset (modificabile per blocco)
 
 export const COMBO_TYPES = [
   { id: "none", label: "Singolo" },
-  { id: "superset", label: "Superset" },
-  { id: "jumpset", label: "Jumpset" },
+  { id: "superset", label: "Superset", desc: "Un esercizio dopo l'altro" },
+  { id: "jumpset", label: "Jumpset", desc: "Una breve pausa tra un esercizio e l'altro" },
 ];
 
 export function getCombo(item) {
@@ -165,9 +192,10 @@ export function makePart(overrides = {}) {
   };
 }
 
-// "8-10", "30s", "max"
+// "8-10", "30s", "max", "20:00" (cardio)
 export function partAmountLabel(p) {
   const t = p?.type || "reps";
+  if (t === "cardio") return formatMMSS(p.repsMax ?? p.repsMin ?? 0);
   if (t === "amrap") return "max";
   const lbl = repsLabel(p.repsMin ?? 1, p.repsMax ?? p.repsMin ?? 1);
   return t === "time" ? `${lbl}s` : lbl;
@@ -178,21 +206,24 @@ export function blockTitle(item) {
   return getParts(item).map((p) => p.exercise).join(" + ");
 }
 
-// "4x 8-10 + 7-9"
+// "4x 8-10 + 7-9" (un cardio da solo non ha serie: solo la durata, "20:00")
 export function blockTarget(item) {
   const parts = getParts(item);
-  if (parts.length === 1) return `${item.sets}x${partAmountLabel(parts[0])}`;
+  if (parts.length === 1) {
+    if (parts[0].type === "cardio") return partAmountLabel(parts[0]);
+    return `${item.sets}x${partAmountLabel(parts[0])}`;
+  }
   return `${item.sets}x ${parts.map(partAmountLabel).join(" + ")}`;
 }
 
-// Recupero dopo un esercizio: dentro un blocco è breve (0 superset, 1' jumpset),
-// il recupero della scheda vale solo alla fine del blocco.
+// Recupero dopo un esercizio: dentro un blocco è breve (0 superset, la pausa
+// impostata per il jumpset), il recupero della scheda vale solo a fine blocco.
 export function restAfterPart(item, partIdx) {
   const parts = getParts(item);
   const combo = getCombo(item);
   if (partIdx < parts.length - 1 && combo !== "none") {
     return combo === "jumpset"
-      ? { seconds: JUMPSET_REST, kind: "jumpset", nextExercise: parts[partIdx + 1].exercise }
+      ? { seconds: item.jumpsetRestSeconds ?? JUMPSET_REST, kind: "jumpset", nextExercise: parts[partIdx + 1].exercise }
       : { seconds: 0, kind: "superset", nextExercise: parts[partIdx + 1].exercise };
   }
   return { seconds: item.restSeconds || 0, kind: "rest" };
@@ -241,4 +272,62 @@ export function dayOptions(schede) {
     });
   });
   return out;
+}
+
+// --- Suoneria di fine timer ---
+// Suona a intervalli finché non viene fermata, e comunque si spegne da sola
+// dopo 10 secondi. Restituisce la funzione per interromperla.
+export function startAlarm(maxMs = 10000) {
+  let ctx = null;
+  let interval = null;
+  let stopped = false;
+
+  const beep = () => {
+    if (stopped) return;
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      if (!ctx) ctx = new Ctx();
+      const t = ctx.currentTime;
+      [0, 0.18].forEach((offset) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = "square";
+        osc.frequency.setValueAtTime(offset ? 1046 : 880, t + offset);
+        gain.gain.setValueAtTime(0.0001, t + offset);
+        gain.gain.exponentialRampToValueAtTime(0.3, t + offset + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, t + offset + 0.16);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(t + offset);
+        osc.stop(t + offset + 0.18);
+      });
+      if (navigator.vibrate) navigator.vibrate([180, 90, 180]);
+    } catch (e) {
+      /* audio non disponibile */
+    }
+  };
+
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    if (interval) clearInterval(interval);
+    if (ctx) setTimeout(() => ctx.close().catch(() => {}), 300);
+  };
+
+  beep();
+  interval = setInterval(beep, 900);
+  setTimeout(stop, maxMs);
+  return stop;
+}
+
+// "8:00" o "480" -> 480 secondi
+export function parseMMSS(text) {
+  const v = String(text || "").trim();
+  if (!v) return 0;
+  if (v.includes(":")) {
+    const [m, s] = v.split(":");
+    return Math.max(0, (parseInt(m) || 0) * 60 + (parseInt(s) || 0));
+  }
+  return Math.max(0, parseInt(v) || 0);
 }

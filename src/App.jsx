@@ -3,9 +3,9 @@ import { Dumbbell, ListChecks, BarChart3, Unlock, Info, Sun, Moon, LogIn, User }
 
 import { auth, googleProvider, db } from "./firebase";
 import { signInWithPopup, signOut, onAuthStateChanged } from "firebase/auth";
-import { doc, setDoc, onSnapshot, collection, addDoc, deleteDoc, query, where } from "firebase/firestore";
+import { doc, setDoc, onSnapshot, collection, addDoc, deleteDoc, query, where, getDocs } from "firebase/firestore";
 import { ADMIN_EMAIL } from "./config";
-import { uid, confirmThen } from "./lib/utils";
+import { uid, confirmThen, getDays } from "./lib/utils";
 
 import InfoModal from "./components/InfoModal";
 import AccountModal from "./components/AccountModal";
@@ -68,6 +68,98 @@ export default function App() {
   useEffect(() => {
     if (view === "admin" && authUser && !isStaff) setView("stats");
   }, [view, authUser, isStaff]);
+
+  // Conteggio totale degli allenamenti registrati per esercizio, su tutti gli
+  // utenti: serve solo ad admin/PT nell'anagrafica esercizi. Letto una tantum
+  // (non in tempo reale) quando si apre la sezione, per non pesare troppo su
+  // Firestore: ogni utente conta come 1 lettura, indipendentemente da quanti
+  // allenamenti ha registrato.
+  const [totalLogCounts, setTotalLogCounts] = useState({});
+  const [totalsLoading, setTotalsLoading] = useState(false);
+
+  const fetchTotalLogCounts = useCallback(async () => {
+    if (!isStaff) return;
+    setTotalsLoading(true);
+    try {
+      const snap = await getDocs(collection(db, "users"));
+      const counts = {};
+      snap.forEach((d) => {
+        const userLogs = d.data()?.logs;
+        if (!Array.isArray(userLogs)) return;
+        userLogs.forEach((l) => {
+          // Il back-off fa parte dello stesso allenamento del top set: contarlo
+          // a parte lo conterebbe due volte per la stessa sessione
+          if (!l?.exercise || l.backoff) return;
+          counts[l.exercise] = (counts[l.exercise] || 0) + 1;
+        });
+      });
+      setTotalLogCounts(counts);
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setTotalsLoading(false);
+    }
+  }, [isStaff]);
+
+  useEffect(() => {
+    if (view === "admin" && isStaff) fetchTotalLogCounts();
+  }, [view, isStaff]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Admin/PT possono guardare le statistiche di un altro utente, cercandolo
+  // per nome/email: elenco utenti (solo mentre si è sulla tab Statistiche, per
+  // non tenere un listener acceso inutilmente) e log dell'utente scelto.
+  const [staffDirectory, setStaffDirectory] = useState([]);
+  const [viewingUid, setViewingUid] = useState(null);
+  const [viewingLogs, setViewingLogs] = useState(null);
+  const [viewingLoading, setViewingLoading] = useState(false);
+
+  useEffect(() => {
+    if (view !== "stats") setViewingUid(null);
+  }, [view]);
+
+  useEffect(() => {
+    if (!isStaff || !authUser || view !== "stats") {
+      setStaffDirectory([]);
+      return;
+    }
+    const unsub = onSnapshot(
+      collection(db, "directory"),
+      (snap) => {
+        const list = snap.docs
+          .map((d) => ({ uid: d.id, ...d.data() }))
+          .filter((u) => u.uid !== authUser.uid)
+          .sort((a, b) => (a.displayName || a.email || "").localeCompare(b.displayName || b.email || ""));
+        setStaffDirectory(list);
+      },
+      (e) => console.error(e)
+    );
+    return unsub;
+  }, [isStaff, authUser, view]);
+
+  useEffect(() => {
+    if (!viewingUid) {
+      setViewingLogs(null);
+      return;
+    }
+    setViewingLoading(true);
+    const unsub = onSnapshot(
+      doc(db, "users", viewingUid),
+      (snap) => {
+        const data = snap.data();
+        setViewingLogs(Array.isArray(data?.logs) ? data.logs : []);
+        setViewingLoading(false);
+      },
+      (e) => {
+        console.error(e);
+        setViewingLogs([]);
+        setViewingLoading(false);
+      }
+    );
+    return unsub;
+  }, [viewingUid]);
+
+  const viewingUser = staffDirectory.find((u) => u.uid === viewingUid) || null;
+  const statsLogs = viewingUid ? viewingLogs || [] : logs;
 
   // Registra/aggiorna il proprio profilo nella directory utenti (email, nome,
   // ultimo accesso) e resta in ascolto del proprio ruolo (l'admin può
@@ -242,21 +334,6 @@ export default function App() {
     return unsub;
   }, [authUser]);
 
-  // Schede assegnate a me da admin o personal trainer
-  useEffect(() => {
-    if (!authUser) {
-      setAssignments([]);
-      return;
-    }
-    const q = query(collection(db, "assignments"), where("toUid", "==", authUser.uid));
-    const unsub = onSnapshot(
-      q,
-      (snap) => setAssignments(snap.docs.map((d) => ({ id: d.id, ...d.data() }))),
-      (e) => console.error(e)
-    );
-    return unsub;
-  }, [authUser]);
-
   const persist = useCallback(
     (key, value) => {
       try {
@@ -294,6 +371,67 @@ export default function App() {
     },
     [authUser]
   );
+
+  // Applica in automatico l'aggiornamento di una scheda già assegnata: trova
+  // la mia copia collegata (sourceSchedaId) e ne sostituisce nome e giorni,
+  // mantenendo però i miei id locali (sourceDayId fa da ponte) così la
+  // cronologia degli allenamenti resta agganciata.
+  const applySchedaUpdate = useCallback(
+    (a) => {
+      setSchede((prev) => {
+        let idx = prev.findIndex((s) => s.sourceSchedaId === a.sourceSchedaId);
+        // Assegnazioni accettate prima che esistesse questo collegamento non
+        // hanno sourceSchedaId salvato: ripiego sul nome (solo tra le schede
+        // che non sono già agganciate a un'altra origine). Una volta trovata,
+        // da qui in poi resta agganciata tramite sourceSchedaId.
+        if (idx === -1) {
+          idx = prev.findIndex((s) => !s.sourceSchedaId && s.name === a.scheda?.name);
+        }
+        if (idx === -1) return prev; // nessuna corrispondenza: aggiornamento ignorato
+        const local = prev[idx];
+        const incomingDays = Array.isArray(a.scheda?.days) ? a.scheda.days : [];
+        const localByOrigin = new Map(
+          (local.days || []).filter((d) => d.sourceDayId).map((d) => [d.sourceDayId, d])
+        );
+        // Stesso ripiego sul nome per i giorni non ancora agganciati
+        const localByName = new Map(
+          (local.days || []).filter((d) => !d.sourceDayId).map((d) => [d.name, d])
+        );
+        const days = incomingDays.map((d) => {
+          const existing = localByOrigin.get(d.id) || localByName.get(d.name);
+          return { id: existing ? existing.id : uid(), name: d.name, items: d.items, sourceDayId: d.id };
+        });
+        const next = prev.slice();
+        next[idx] = { ...local, name: a.scheda?.name || local.name, sourceSchedaId: a.sourceSchedaId, days };
+        persist(SCHEDE_KEY, next);
+        return next;
+      });
+      deleteDoc(doc(db, "assignments", a.id)).catch((e) => console.error(e));
+    },
+    [persist]
+  );
+
+  // Schede assegnate a me da admin o personal trainer: quelle nuove restano
+  // in sospeso finché non le accetto, quelle di tipo "update" (un PT/admin ha
+  // aggiornato una scheda già assegnata) si applicano da sole.
+  useEffect(() => {
+    if (!authUser) {
+      setAssignments([]);
+      return;
+    }
+    const q = query(collection(db, "assignments"), where("toUid", "==", authUser.uid));
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
+        const all = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+        const updates = all.filter((a) => a.kind === "update");
+        setAssignments(all.filter((a) => a.kind !== "update"));
+        updates.forEach(applySchedaUpdate);
+      },
+      (e) => console.error(e)
+    );
+    return unsub;
+  }, [authUser, applySchedaUpdate]);
 
   const addLog = useCallback(
     (entry) => {
@@ -552,18 +690,20 @@ export default function App() {
     [persist]
   );
 
-  // Accetta una scheda assegnata: entra tra le mie e diventa modificabile da me
+  // Accetta una scheda assegnata: entra tra le mie e diventa modificabile da me.
+  // sourceSchedaId/sourceDayId restano come "ponte" verso l'originale di chi
+  // me l'ha mandata, per riconoscere gli aggiornamenti futuri.
   const acceptAssignment = useCallback(
     (a) => {
-      // La scheda assegnata diventa una mia copia, con giorni e id nuovi
       const src = a.scheda || {};
       const nuova = {
         id: uid(),
         name: src.name || "Scheda assegnata",
+        sourceSchedaId: a.sourceSchedaId || null,
         days: (Array.isArray(src.days) && src.days.length
           ? src.days
           : [{ id: uid(), name: src.name || "Giorno 1", items: src.items || [] }]
-        ).map((d) => ({ ...d, id: uid() })),
+        ).map((d) => ({ ...d, sourceDayId: d.id, id: uid() })),
       };
       setSchede((prev) => {
         const next = [...prev, nuova];
@@ -580,6 +720,29 @@ export default function App() {
       deleteDoc(doc(db, "assignments", a.id)).catch((e) => console.error(e));
     });
   }, []);
+
+  // Rimanda una scheda già assegnata a chi la sta già usando: sovrascrive la
+  // loro copia con la versione attuale invece di crearne una nuova.
+  const pushSchedaUpdate = useCallback(
+    (scheda) => {
+      const targets = scheda.assignedTo || [];
+      if (!targets.length || !authUser) return;
+      const daysCopy = JSON.parse(JSON.stringify(getDays(scheda)));
+      targets.forEach((t) => {
+        const id = uid();
+        setDoc(doc(db, "assignments", id), {
+          id,
+          toUid: t.uid,
+          fromName: authUser.displayName || authUser.email,
+          kind: "update",
+          sourceSchedaId: scheda.id,
+          scheda: { name: scheda.name, days: daysCopy },
+          createdAt: Date.now(),
+        }).catch((e) => console.error(e));
+      });
+    },
+    [authUser]
+  );
 
   const setActiveScheda = useCallback(
     (id) => {
@@ -807,6 +970,16 @@ export default function App() {
           border-radius: 10px; padding: 9px 12px; margin-bottom: 12px;
           font-size: 12.5px; color: var(--ink);
         }
+
+        /* Scheda in arrivo da un admin/PT, in attesa di accettazione */
+        .g-assign-banner {
+          display: flex; align-items: center; justify-content: space-between; gap: 10px;
+          flex-wrap: wrap;
+          background: var(--accent-dim); border: 1px solid var(--accent);
+          border-radius: 12px; padding: 12px 14px; margin-bottom: 8px;
+        }
+        .g-assign-banner:last-child { margin-bottom: 0; }
+        .g-assign-banner svg { color: var(--accent); flex-shrink: 0; }
         .g-draft-banner .g-del-btn {
           color: var(--accent); font-weight: 600; font-size: 12px; background: none; border: none; cursor: pointer;
         }
@@ -914,6 +1087,18 @@ export default function App() {
           cursor: pointer;
         }
 
+        /* Campo di ricerca: lente a sinistra, x per cancellare a destra */
+        .g-search-field { position: relative; display: flex; align-items: center; }
+        .g-search-field > svg:first-child {
+          position: absolute; left: 12px; color: var(--ink-dim); pointer-events: none;
+        }
+        .g-search-field .g-input { padding-left: 36px; padding-right: 32px; }
+        .g-search-clear {
+          position: absolute; right: 6px; background: none; border: none; color: var(--ink-dim);
+          cursor: pointer; padding: 7px; display: flex; align-items: center;
+        }
+        .g-search-clear:hover { color: var(--ink); }
+
         .g-counter { display: flex; align-items: center; gap: 10px; }
         .g-counter-btn {
           width: 34px; height: 34px; border-radius: 8px; border: 1px solid var(--line);
@@ -928,12 +1113,15 @@ export default function App() {
           letter-spacing: 0.03em; text-transform: uppercase; cursor: pointer; margin-top: 4px;
         }
         .g-submit:disabled { opacity: 0.4; cursor: not-allowed; }
+        /* Azioni "intermedie" (aggiungi al giorno/alla sessione): colore
+           secondario del sito (--steel), non grigio, così si vede bene ma
+           resta distinto dal salvataggio finale in arancione */
         .g-submit-secondary {
-          background: var(--surface-2); color: var(--ink); border: 1px solid var(--line);
+          background: var(--steel); color: #fff; border: none;
         }
 
         .g-timer-box {
-          margin-top: 16px; background: var(--surface-2); border: 1px solid var(--line);
+          margin-top: 22px; background: var(--surface-2); border: 1px solid var(--line);
           border-radius: 12px; padding: 14px; text-align: center;
         }
         .g-timer-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink-dim); margin-bottom: 4px; }
@@ -981,7 +1169,7 @@ export default function App() {
         }
 
         .g-sets-reps-row {
-          display: flex; justify-content: center; gap: 32px; margin-top: 22px;
+          display: flex; justify-content: center; gap: 32px; margin-top: 26px;
         }
         .g-danger-banner {
           display: flex; align-items: flex-start; gap: 8px;
@@ -1024,6 +1212,18 @@ export default function App() {
         }
         .g-seg-btn.active { border-color: var(--accent); color: var(--ink); background: var(--accent-dim); }
 
+        /* Scelta superset/jumpset: nome + spiegazione compatta sotto, non un
+           paragrafo separato — più chiaro con più di due esercizi abbinati */
+        .g-combo-choice-row { display: flex; gap: 8px; }
+        .g-combo-choice {
+          flex: 1; display: flex; flex-direction: column; align-items: center; gap: 2px;
+          padding: 8px 10px; border-radius: 9px; border: 1px solid var(--line);
+          background: var(--surface-2); color: var(--ink-dim); cursor: pointer; text-align: center;
+        }
+        .g-combo-choice.active { border-color: var(--accent); background: var(--accent-dim); }
+        .g-combo-choice-name { font-size: 12.5px; font-weight: 700; color: var(--ink); }
+        .g-combo-choice-desc { font-size: 10.5px; color: var(--ink-dim); line-height: 1.25; }
+
         .g-timer-tabs { display: flex; gap: 6px; justify-content: center; margin-bottom: 10px; }
         .g-ex-meta {
           font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.06em;
@@ -1031,7 +1231,9 @@ export default function App() {
         }
         .g-ex-name {
           font-family: 'Oswald', sans-serif; font-size: 19px; font-weight: 600;
-          letter-spacing: 0.01em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+          letter-spacing: 0.01em; line-height: 1.2;
+          /* I nomi lunghi vanno a capo: devono restare leggibili per intero */
+          white-space: normal; overflow-wrap: anywhere; word-break: break-word;
         }
         .g-parts-link {
           background: none; border: none; padding: 0; cursor: pointer;
@@ -1077,6 +1279,18 @@ export default function App() {
         .g-reg-row:last-child { border-bottom: none; }
         .g-reg-name { font-size: 14px; font-weight: 500; }
         .g-reg-count { font-size: 11px; color: var(--ink-dim); margin-top: 1px; }
+
+        /* Elenco statico di risultati ricerca (es. scelta utente in Statistiche):
+           stesso stile del menu a tendina di ExercisePicker, ma non "flottante" */
+        .g-user-pick-list {
+          margin-top: 8px; border: 1px solid var(--line); border-radius: 10px;
+          background: var(--surface-2); max-height: 260px; overflow-y: auto;
+        }
+        .g-user-pick-item {
+          padding: 10px 12px; cursor: pointer; border-bottom: 1px solid var(--line);
+        }
+        .g-user-pick-item:last-child { border-bottom: none; }
+        .g-user-pick-item:hover { background: var(--accent-dim); }
         .g-bodyparts-panel {
           display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-start;
           padding: 10px 4px 14px 4px;
@@ -1084,13 +1298,15 @@ export default function App() {
         }
 
         .g-scheda-row {
-          padding: 12px 4px; border-bottom: 1px solid var(--line);
+          padding: 13px 6px; border-bottom: 1px solid var(--line);
           display: flex; align-items: center; justify-content: space-between; gap: 10px;
+          border-radius: 8px; transition: background 0.15s;
         }
+        .g-scheda-row:hover { background: var(--surface-2); }
         .g-scheda-row:last-child { border-bottom: none; }
         .g-menu {
           position: absolute; top: calc(100% + 6px); right: 0; z-index: 40;
-          min-width: 178px; background: var(--surface-2); border: 1px solid var(--line);
+          min-width: 190px; background: var(--surface-2); border: 1px solid var(--line);
           border-radius: 10px; padding: 5px; box-shadow: 0 12px 28px rgba(0,0,0,0.45);
         }
         .g-menu-item {
@@ -1103,6 +1319,7 @@ export default function App() {
         .g-menu-danger { color: var(--accent); }
         .g-menu-danger svg { color: var(--accent); }
         .g-menu-danger:hover { background: rgba(193,80,46,0.14); }
+        .g-menu-divider { height: 1px; background: var(--line); margin: 5px 4px; }
 
         .g-active-badge {
           display: inline-flex; align-items: center; gap: 3px; margin-left: 8px;
@@ -1128,14 +1345,113 @@ export default function App() {
           background: var(--surface); padding: 1px 5px; border-radius: 4px; font-size: 11px;
         }
 
-        .g-rest-stepper {
-          display: flex; align-items: center; gap: 6px;
+        .g-row-card {
+          margin-top: 12px; padding: 12px; border-radius: 12px;
+          background: var(--surface-2); border: 1px solid var(--line);
         }
-        .g-rest-value {
-          flex: 1; text-align: center; font-size: 15px; font-weight: 700;
+        .g-row-card .g-input { background: var(--surface); }
+        .g-row-backoff { border-style: dashed; border-color: var(--steel); }
+        .g-row-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+        .g-row-name {
+          font-weight: 600; font-size: 14.5px; line-height: 1.25;
+          overflow-wrap: anywhere;
+        }
+        .g-row-parts { font-size: 10.5px; color: var(--ink-dim); margin-top: 2px; }
+        .g-row-fields { display: flex; gap: 8px; margin-top: 12px; }
+        .g-field-mini { flex: 1; min-width: 0; }
+        .g-field-mini .g-field-label { text-align: center; font-size: 10px; }
+        .g-mini-stepper { display: flex; align-items: center; gap: 4px; }
+        .g-mini-stepper .g-counter-btn { width: 30px; height: 32px; min-width: 30px; flex-shrink: 0; }
+        .g-mini-input {
+          flex: 1; min-width: 0; text-align: center; padding: 7px 2px;
+          font-size: 15px; font-weight: 600;
+        }
+        .g-mini-timer {
+          display: flex; align-items: center; justify-content: center; gap: 10px;
+          margin: 16px 0; padding: 10px 14px; border-radius: 999px;
+          background: var(--surface-2); border: 1px solid var(--steel);
+        }
+        .g-mini-timer-label {
+          font-size: 10px; text-transform: uppercase; letter-spacing: 0.07em;
+          color: var(--steel); font-weight: 700;
+        }
+        .g-mini-timer-value { font-size: 17px; font-weight: 700; min-width: 52px; text-align: center; }
+        .g-mini-timer-btn {
+          background: var(--surface); border: 1px solid var(--line); color: var(--ink);
+          border-radius: 8px; padding: 6px 10px; cursor: pointer; font-size: 12px;
+          display: inline-flex; align-items: center; gap: 4px;
+        }
+        .g-mini-timer-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 700; }
+
+        .g-part-block {
+          margin-top: 18px; padding: 16px; border-radius: 12px;
+          background: var(--surface-2); border: 1px solid var(--line);
+        }
+        .g-part-block .g-input,
+        .g-part-block .g-counter-btn,
+        .g-part-block .g-step-pill { background: var(--surface); }
+        .g-part-block-head {
+          display: flex; align-items: center; justify-content: space-between;
+          gap: 10px; padding-bottom: 12px; border-bottom: 1px solid var(--line);
+        }
+        .g-part-block-name {
+          font-family: 'Oswald', sans-serif; font-size: 15px; font-weight: 600;
+          overflow-wrap: anywhere; line-height: 1.25;
+        }
+
+        .g-combo-list {
+          margin-top: 12px; padding: 10px; border-radius: 10px;
+          background: var(--surface-2); border: 1px solid var(--line);
+        }
+        .g-combo-list-title {
+          font-size: 10px; text-transform: uppercase; letter-spacing: 0.07em;
+          color: var(--steel); font-weight: 700; margin-bottom: 8px; text-align: center;
+        }
+        .g-combo-item {
+          display: flex; align-items: center; justify-content: space-between; gap: 8px;
+          width: 100%; text-align: left; cursor: pointer;
           background: var(--surface); border: 1px solid var(--line);
-          border-radius: 8px; padding: 7px 4px;
+          border-radius: 8px; padding: 8px 10px; color: var(--ink-dim);
         }
+        .g-combo-item.active {
+          border-color: var(--accent); background: var(--accent-dim); color: var(--ink);
+        }
+        .g-combo-item-name { font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
+        .g-combo-item-target {
+          font-family: 'JetBrains Mono', monospace; font-size: 11.5px;
+          color: var(--ink-dim); flex-shrink: 0;
+        }
+        .g-combo-arrow {
+          text-align: center; font-size: 10.5px; color: var(--steel);
+          text-transform: uppercase; letter-spacing: 0.06em; font-weight: 700;
+          padding: 16px 0 6px 0;
+        }
+
+        .g-combo-divider {
+          text-align: center; font-size: 11px; color: var(--steel);
+          text-transform: uppercase; letter-spacing: 0.06em; font-weight: 700;
+          margin: 10px 0 -2px 0;
+        }
+        .g-combo-label { color: var(--steel); font-weight: 700; }
+
+        /* Campo durata mm:ss con gli step +/- incorporati nella textbox
+           (invece che a fianco), come nel recupero. */
+        .g-duration-field { position: relative; }
+        .g-duration-input {
+          width: 100%; text-align: center; font-size: 15px; font-weight: 700;
+          background: var(--surface); border: 1px solid var(--line); color: var(--ink);
+          border-radius: 8px; padding: 9px 34px; outline: none; font-family: inherit;
+        }
+        .g-duration-input:focus { border-color: var(--accent); }
+        .g-duration-btn {
+          position: absolute; top: 1px; bottom: 1px; width: 30px;
+          display: flex; align-items: center; justify-content: center;
+          background: none; border: none; color: var(--ink-dim); font-size: 16px;
+          cursor: pointer; touch-action: manipulation;
+        }
+        .g-duration-btn:hover, .g-duration-btn:active { color: var(--accent); }
+        .g-duration-btn-left { left: 0; border-radius: 8px 0 0 8px; }
+        .g-duration-btn-right { right: 0; border-radius: 0 8px 8px 0; }
 
         .g-day-row {
           display: flex; align-items: center; gap: 4px;
@@ -1158,8 +1474,8 @@ export default function App() {
           font-size: 10px; color: var(--ink-dim); margin-top: 4px;
           text-transform: uppercase; letter-spacing: 0.05em;
         }
-        .g-scheda-name { font-weight: 600; font-size: 14.5px; }
-        .g-scheda-meta { font-size: 11.5px; color: var(--ink-dim); margin-top: 2px; }
+        .g-scheda-name { font-weight: 600; font-size: 15.5px; }
+        .g-scheda-meta { font-size: 12px; color: var(--ink-dim); margin-top: 3px; }
         .g-icon-btn {
           background: var(--surface-2); border: 1px solid var(--line); color: var(--ink-dim);
           border-radius: 8px; padding: 7px; cursor: pointer; display: flex; align-items: center;
@@ -1188,14 +1504,32 @@ export default function App() {
         }
         .g-move-slot:hover { background: var(--accent-dim); }
 
+        /* "Aggiungi giorno" / "Aggiungi esercizio abbinato": stesso trattamento,
+           colore secondario del sito (--steel) invece del grigio neutro */
+        .g-add-btn {
+          display: flex; align-items: center; justify-content: center; gap: 6px;
+          width: 100%; padding: 9px; margin-top: 6px;
+          background: none; border: 1px dashed var(--steel); border-radius: 9px;
+          color: var(--steel); font-size: 13px; font-weight: 600; cursor: pointer;
+        }
+        .g-add-btn:hover { opacity: 0.8; }
+
+        .g-spin { animation: g-spin 0.9s linear infinite; }
+        @keyframes g-spin { to { transform: rotate(360deg); } }
+
         .g-block-form {
-          margin-top: 14px; padding-top: 14px; border-top: 1px dashed var(--line);
+          margin-top: 16px; padding: 14px; border-radius: 14px;
+          background: var(--surface-2); border: 1px solid var(--line);
         }
         .g-part-card {
-          background: var(--surface-2); border: 1px solid var(--line);
+          background: var(--surface); border: 1px solid var(--line);
           border-radius: 10px; padding: 12px; margin-bottom: 8px;
         }
-        .g-part-card .g-input { background: var(--surface); }
+        .g-part-card .g-input, .g-part-card .g-duration-input { background: var(--surface-2); }
+        .g-block-actions {
+          display: flex; gap: 8px; margin-top: 16px; padding-top: 14px;
+          border-top: 1px solid var(--line);
+        }
 
         .g-set-row {
           display: flex; align-items: center; gap: 6px; margin-bottom: 6px;
@@ -1214,10 +1548,17 @@ export default function App() {
           font-size: 10.5px; color: var(--ink-dim); text-transform: uppercase;
           letter-spacing: 0.04em; width: 24px; flex-shrink: 0;
         }
+        .g-set-head {
+          display: flex; align-items: center; gap: 6px; margin-bottom: 4px;
+          font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em;
+          color: var(--ink-dim); font-weight: 700;
+        }
+        .g-set-col { flex: 1; text-align: center; }
+        .g-set-spacer { width: 26px; flex-shrink: 0; }
         .g-set-row .g-del-btn { opacity: 0.5; }
         .g-set-row:hover .g-del-btn { opacity: 1; }
         .g-sets-wrap {
-          margin-top: 18px; background: var(--surface-2); border: 1px solid var(--line);
+          margin-top: 20px; background: var(--surface-2); border: 1px solid var(--line);
           border-radius: 12px; padding: 12px;
         }
         .g-sets-wrap .g-input { background: var(--surface); }
@@ -1338,7 +1679,16 @@ export default function App() {
         {loading ? (
           <div className="g-empty">Caricamento...</div>
         ) : view === "stats" ? (
-          <StatsPage logs={logs} goToLog={() => setView("log")} />
+          <StatsPage
+            logs={statsLogs}
+            goToLog={() => setView("log")}
+            isStaff={isStaff}
+            directoryUsers={staffDirectory}
+            viewingUid={viewingUid}
+            viewingUser={viewingUser}
+            viewingLoading={viewingLoading}
+            onViewUser={setViewingUid}
+          />
         ) : view === "log" ? (
           <LogPage
             exercises={exercises}
@@ -1366,6 +1716,7 @@ export default function App() {
             assignments={assignments}
             onAcceptAssignment={acceptAssignment}
             onRejectAssignment={rejectAssignment}
+            onPushUpdate={pushSchedaUpdate}
             activeSchedaId={activeSchedaId}
             onSetActive={setActiveScheda}
           />
@@ -1374,6 +1725,9 @@ export default function App() {
             exercises={exercises}
             exerciseMeta={exerciseMeta}
             logs={logs}
+            totalLogCounts={totalLogCounts}
+            totalsLoading={totalsLoading}
+            onRefreshTotals={fetchTotalLogCounts}
             authUser={authUser}
             isAdmin={isAdmin}
             isPT={isPT}

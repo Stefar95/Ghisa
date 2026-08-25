@@ -8,6 +8,9 @@ export default function AdminPage({
   exercises,
   exerciseMeta,
   logs,
+  totalLogCounts,
+  totalsLoading,
+  onRefreshTotals,
   authUser,
   isAdmin,
   isPT,
@@ -92,6 +95,9 @@ export default function AdminPage({
           exercises={exercises}
           exerciseMeta={exerciseMeta}
           logs={logs}
+          totalLogCounts={totalLogCounts}
+          totalsLoading={totalsLoading}
+          onRefreshTotals={onRefreshTotals}
           onAdd={onAddExercise}
           onRemove={onRemoveExercise}
           onMerge={onMergeExercises}

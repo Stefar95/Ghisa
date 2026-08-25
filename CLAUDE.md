@@ -3,8 +3,11 @@
 App per tracciare allenamenti in palestra (schede, carichi, progressi).
 Pensata soprattutto per l'uso da telefono, in palestra. Ideata da Stefano.
 
-L'interfaccia e i commenti nel codice sono **in italiano**: mantieni questa lingua
-per testi UI, commenti e messaggi.
+## 🇮🇹 Lingua
+
+**Rispondi sempre in italiano**, sia quando spieghi cosa stai facendo sia nei
+riepiloghi finali. Anche i commenti nel codice, i testi dell'interfaccia e i
+messaggi di conferma vanno scritti in italiano.
 
 ---
 
@@ -28,6 +31,11 @@ per testi UI, commenti e messaggi.
 - Build: `npm run build`
 - Deploy: `firebase deploy --only hosting` (Firebase Hosting)
 - Richiede Node 18+ (con Node 16 Vite 5 va in errore su `crypto.getRandomValues`).
+- Le regole di sicurezza Firestore sono tracciate in `firestore.rules` (root del
+  repo) e collegate in `firebase.json` → `firebase deploy --only firestore:rules`
+  le pubblica; in alternativa si possono incollare a mano in Firebase Console →
+  Firestore Database → Regole. Aggiornale qui prima, non solo in console, così
+  restano documentate e riutilizzabili.
 
 ---
 
@@ -71,7 +79,7 @@ lì e usa le variabili, non colori fissi.
 | Percorso | Contenuto | Chi può |
 |---|---|---|
 | `shared/registry` | `exercises: string[]`, `exerciseMeta: { [esercizio]: string[] }` (parti del corpo) | lettura pubblica, scrittura a chiunque sia autenticato — **è l'anagrafica unica per tutti** |
-| `users/{uid}` | `logs`, `schede`, `draftSession` | solo il proprietario (+ admin) — dati **privati per utente** |
+| `users/{uid}` | `logs`, `schede`, `draftSession` | scrittura solo proprietario + admin; **lettura anche PT** (serve per il conteggio totale allenamenti in Anagrafica) — dati **privati per utente** |
 | `directory/{uid}` | `email`, `displayName`, `lastSeen`, `isPT` | il proprietario + admin |
 
 Ogni dato è anche in `localStorage` (chiavi `ghisa-*`) così l'app funziona offline

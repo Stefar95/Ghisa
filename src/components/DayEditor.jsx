@@ -2,9 +2,14 @@ import { useState } from "react";
 import { Plus, Pencil, X, MoveVertical, CornerDownLeft, ChevronLeft } from "lucide-react";
 import {
   EX_TYPES, COMBO_TYPES, getCombo, comboLabel, getParts, makePart,
-  blockTitle, blockTarget, formatMMSS,
+  blockTitle, blockTarget, defaultDuration, JUMPSET_REST,
 } from "../lib/utils";
 import ExercisePicker from "./ExercisePicker";
+import DurationField from "./DurationField";
+import NumberField from "./NumberField";
+
+// Default ripetizioni quando si passa (o si riparte) dal tipo "Ripetizioni"
+const REPS_DEFAULT = 8;
 
 // Editor di un singolo giorno di allenamento: nome del giorno + elenco esercizi
 export default function DayEditor({ exercises, exerciseMeta, day, onChange, onClose, onAddExercise }) {
@@ -21,7 +26,9 @@ export default function DayEditor({ exercises, exerciseMeta, day, onChange, onCl
   const [combo, setCombo] = useState("none");
   const [parts, setParts] = useState([makePart()]);
   const [blockSets, setBlockSets] = useState(3);
-  const [blockRestSec, setBlockRestSec] = useState(120);
+  const [blockRestSec, setBlockRestSec] = useState(90);
+  // Pausa tra gli esercizi di un jumpset (di default 1', ma modificabile)
+  const [blockJumpsetRest, setBlockJumpsetRest] = useState(JUMPSET_REST);
   const [blockWarmup, setBlockWarmup] = useState(false);
   const [blockNote, setBlockNote] = useState("");
 
@@ -29,7 +36,8 @@ export default function DayEditor({ exercises, exerciseMeta, day, onChange, onCl
     setCombo("none");
     setParts([makePart()]);
     setBlockSets(3);
-    setBlockRestSec(120);
+    setBlockRestSec(90);
+    setBlockJumpsetRest(JUMPSET_REST);
     setBlockWarmup(false);
     setBlockNote("");
     setEditingItemIdx(null);
@@ -70,7 +78,7 @@ export default function DayEditor({ exercises, exerciseMeta, day, onChange, onCl
     const cleanParts = valid.map((p) => {
       const min = Math.min(p.repsMin, p.repsMax);
       const max = Math.max(p.repsMin, p.repsMax);
-      const boAllowed = p.type !== "amrap" && !p.noWeight && p.backoffSets > 0;
+      const boAllowed = p.type !== "amrap" && p.type !== "cardio" && !p.noWeight && p.backoffSets > 0;
       return {
         ...p,
         exercise: p.exercise.trim(),
@@ -83,11 +91,15 @@ export default function DayEditor({ exercises, exerciseMeta, day, onChange, onCl
       };
     });
 
+    // Un cardio da solo non ha il concetto di serie: sempre 1x, senza recupero
+    const cardioOnly = cleanParts.length === 1 && cleanParts[0].type === "cardio";
+
     const block = {
       combo: cleanParts.length > 1 ? (combo === "none" ? "superset" : combo) : "none",
       parts: cleanParts,
-      sets: blockSets,
-      restSeconds: blockRestSec || 0,
+      sets: cardioOnly ? 1 : blockSets,
+      restSeconds: cardioOnly ? 0 : blockRestSec || 0,
+      jumpsetRestSeconds: blockJumpsetRest || 0,
       warmup: blockWarmup,
       note: blockNote.trim(),
     };
@@ -107,6 +119,7 @@ export default function DayEditor({ exercises, exerciseMeta, day, onChange, onCl
     setParts(getParts(it).map((p) => ({ ...makePart(), ...p })));
     setBlockSets(it.sets);
     setBlockRestSec(it.restSeconds || 0);
+    setBlockJumpsetRest(it.jumpsetRestSeconds ?? JUMPSET_REST);
     setBlockWarmup(!!it.warmup);
     setBlockNote(it.note || "");
   };
@@ -137,6 +150,10 @@ export default function DayEditor({ exercises, exerciseMeta, day, onChange, onCl
     if (editingItemIdx === idx) clearBlockForm();
   };
 
+  // Un cardio da solo (cyclette, tapis roulant...) non ha serie né recupero:
+  // è una durata unica, quindi quei campi restano nascosti.
+  const singleCardio = parts.length === 1 && parts[0].type === "cardio";
+
   // Duplica una scheda: utile per partire da un giorno esistente e alleggerirlo
 
   return (
@@ -151,6 +168,12 @@ export default function DayEditor({ exercises, exerciseMeta, day, onChange, onCl
           onChange={(e) => onChange({ ...day, name: e.target.value })}
         />
       </div>
+
+      {editingItemIdx === null && (
+        <button className="g-submit" style={{ marginBottom: 16 }} onClick={onClose}>
+          Salva giorno
+        </button>
+      )}
 
           {/* elenco blocchi già inseriti */}
           {movingIdx !== null && (
@@ -243,7 +266,21 @@ export default function DayEditor({ exercises, exerciseMeta, day, onChange, onCl
                     <button
                       key={t.id}
                       className={`g-seg-btn ${p.type === t.id ? "active" : ""}`}
-                      onClick={() => updatePart(i, { type: t.id })}
+                      onClick={() => {
+                        if (p.type === t.id) return;
+                        // Ripetizioni e durata sono cose distinte: cambiando tipo si
+                        // riparte sempre da un default sensato per quel tipo, invece
+                        // di trascinarsi il numero del tipo precedente (es. "0:30" a
+                        // tempo che ricompare come "30" ripetizioni).
+                        const d = t.id === "time" || t.id === "cardio" ? defaultDuration(t.id) : REPS_DEFAULT;
+                        updatePart(i, {
+                          type: t.id,
+                          repsMin: d,
+                          repsMax: d,
+                          backoffRepsMin: d,
+                          backoffRepsMax: d,
+                        });
+                      }}
                     >
                       {t.label}
                     </button>
@@ -252,23 +289,20 @@ export default function DayEditor({ exercises, exerciseMeta, day, onChange, onCl
 
                 {p.type !== "amrap" && (
                   <div className="g-inline-row">
-                    {p.type === "time" ? (
+                    {p.type === "time" || p.type === "cardio" ? (
                       <div style={{ flex: 1 }}>
-                        <label className="g-field-label">Durata (sec)</label>
-                        <input className="g-input g-num-small" type="number" min="1" step="5"
-                          value={p.repsMax} onChange={(e) => setPartDuration(i, e.target.value)} />
+                        <label className="g-field-label">Durata</label>
+                        <DurationField value={p.repsMax || 0} onChange={(secs) => setPartDuration(i, secs)} />
                       </div>
                     ) : (
                       <>
                         <div style={{ flex: 1 }}>
                           <label className="g-field-label">Rip min</label>
-                          <input className="g-input g-num-small" type="number" min="1"
-                            value={p.repsMin} onChange={(e) => updatePart(i, { repsMin: parseInt(e.target.value) || 1 })} />
+                          <NumberField value={p.repsMin} onChange={(v) => updatePart(i, { repsMin: v })} />
                         </div>
                         <div style={{ flex: 1 }}>
                           <label className="g-field-label">Rip max</label>
-                          <input className="g-input g-num-small" type="number" min="1"
-                            value={p.repsMax} onChange={(e) => updatePart(i, { repsMax: parseInt(e.target.value) || 1 })} />
+                          <NumberField value={p.repsMax} onChange={(v) => updatePart(i, { repsMax: v })} />
                         </div>
                       </>
                     )}
@@ -280,41 +314,45 @@ export default function DayEditor({ exercises, exerciseMeta, day, onChange, onCl
                   Senza carico (corpo libero)
                 </label>
 
-                {p.type !== "amrap" && !p.noWeight && (
+                {p.type !== "amrap" && p.type !== "cardio" && !p.noWeight && (
                   <label className="g-checkbox-row">
                     <input
                       type="checkbox"
                       checked={p.backoffSets > 0}
-                      onChange={(e) => updatePart(i, { backoffSets: e.target.checked ? 2 : 0 })}
+                      onChange={(e) => {
+                        const patch = { backoffSets: e.target.checked ? 2 : 0 };
+                        if (e.target.checked && p.type === "time" && (p.backoffRepsMax || 0) <= 10) {
+                          const d = defaultDuration("time");
+                          patch.backoffRepsMin = d;
+                          patch.backoffRepsMax = d;
+                        }
+                        updatePart(i, patch);
+                      }}
                     />
                     Back-off (serie a carico ridotto)
                   </label>
                 )}
 
-                {p.type !== "amrap" && !p.noWeight && p.backoffSets > 0 && (
+                {p.type !== "amrap" && p.type !== "cardio" && !p.noWeight && p.backoffSets > 0 && (
                   <div className="g-inline-row">
                     <div style={{ flex: 1 }}>
                       <label className="g-field-label">Serie</label>
-                      <input className="g-input g-num-small" type="number" min="1"
-                        value={p.backoffSets} onChange={(e) => updatePart(i, { backoffSets: parseInt(e.target.value) || 1 })} />
+                      <NumberField value={p.backoffSets} onChange={(v) => updatePart(i, { backoffSets: v })} />
                     </div>
                     {p.type === "time" ? (
-                      <div style={{ flex: 1 }}>
-                        <label className="g-field-label">Durata (sec)</label>
-                        <input className="g-input g-num-small" type="number" min="1" step="5"
-                          value={p.backoffRepsMax} onChange={(e) => setPartBackoffDuration(i, e.target.value)} />
+                      <div style={{ flex: 1.6 }}>
+                        <label className="g-field-label">Durata</label>
+                        <DurationField value={p.backoffRepsMax || 0} onChange={(secs) => setPartBackoffDuration(i, secs)} />
                       </div>
                     ) : (
                       <>
                         <div style={{ flex: 1 }}>
                           <label className="g-field-label">Rip min</label>
-                          <input className="g-input g-num-small" type="number" min="1"
-                            value={p.backoffRepsMin} onChange={(e) => updatePart(i, { backoffRepsMin: parseInt(e.target.value) || 1 })} />
+                          <NumberField value={p.backoffRepsMin} onChange={(v) => updatePart(i, { backoffRepsMin: v })} />
                         </div>
                         <div style={{ flex: 1 }}>
                           <label className="g-field-label">Rip max</label>
-                          <input className="g-input g-num-small" type="number" min="1"
-                            value={p.backoffRepsMax} onChange={(e) => updatePart(i, { backoffRepsMax: parseInt(e.target.value) || 1 })} />
+                          <NumberField value={p.backoffRepsMax} onChange={(v) => updatePart(i, { backoffRepsMax: v })} />
                         </div>
                       </>
                     )}
@@ -328,59 +366,50 @@ export default function DayEditor({ exercises, exerciseMeta, day, onChange, onCl
               </div>
             ))}
 
-            <button className="g-icon-btn" style={{ width: "100%", justifyContent: "center", padding: "9px" }} onClick={addPart}>
+            <button className="g-add-btn" onClick={addPart}>
               <Plus size={14} /> Aggiungi esercizio abbinato (superset / jumpset)
             </button>
 
             {parts.length > 1 && (
               <>
-                <label className="g-field-label" style={{ marginTop: 14 }}>Come si eseguono</label>
-                <div className="g-seg">
+                <label className="g-field-label" style={{ marginTop: 12 }}>Come si eseguono</label>
+                <div className="g-combo-choice-row">
                   {COMBO_TYPES.filter((c) => c.id !== "none").map((c) => (
                     <button
                       key={c.id}
-                      className={`g-seg-btn ${combo === c.id ? "active" : ""}`}
+                      className={`g-combo-choice ${combo === c.id ? "active" : ""}`}
                       onClick={() => setCombo(c.id)}
                     >
-                      {c.label}
+                      <span className="g-combo-choice-name">{c.label}</span>
+                      <span className="g-combo-choice-desc">({c.desc})</span>
                     </button>
                   ))}
                 </div>
-                <div style={{ fontSize: 11.5, color: "var(--ink-dim)", marginTop: 6 }}>
-                  Superset: uno subito dopo l'altro. Jumpset: 1' di pausa tra i due.
-                </div>
+                {combo === "jumpset" && (
+                  <div style={{ marginTop: 8, maxWidth: 160 }}>
+                    <label className="g-field-label">Pausa tra gli esercizi</label>
+                    <DurationField value={blockJumpsetRest} onChange={setBlockJumpsetRest} step={5} />
+                  </div>
+                )}
               </>
             )}
 
-            <div className="g-inline-row">
-              <div style={{ flex: 1 }}>
-                <label className="g-field-label">Serie</label>
-                <input className="g-input g-num-small" type="number" min="1"
-                  value={blockSets} onChange={(e) => setBlockSets(parseInt(e.target.value) || 1)} />
+            {singleCardio ? (
+              <div style={{ fontSize: 11.5, color: "var(--ink-dim)", marginTop: 10 }}>
+                Cardio: una durata unica, senza serie né recupero.
               </div>
-              <div style={{ flex: 1.6 }}>
-                <label className="g-field-label">Recupero</label>
-                <div className="g-rest-stepper">
-                  <button
-                    className="g-counter-btn"
-                    onClick={() => setBlockRestSec((v) => Math.max(0, v - 15))}
-                    aria-label="Meno 15 secondi"
-                  >
-                    −
-                  </button>
-                  <div className="g-rest-value ghisa-mono">
-                    {blockRestSec === 0 ? "—" : formatMMSS(blockRestSec)}
-                  </div>
-                  <button
-                    className="g-counter-btn"
-                    onClick={() => setBlockRestSec((v) => v + 15)}
-                    aria-label="Più 15 secondi"
-                  >
-                    +
-                  </button>
+            ) : (
+              <div className="g-inline-row">
+                <div style={{ flex: 1 }}>
+                  <label className="g-field-label">Serie</label>
+                  <NumberField value={blockSets} onChange={setBlockSets} />
+                </div>
+                <div style={{ flex: 1.6 }}>
+                  <label className="g-field-label">Recupero</label>
+                  <DurationField value={blockRestSec} onChange={setBlockRestSec} />
                 </div>
               </div>
-            </div>
+            )}
 
             <label className="g-checkbox-row">
               <input type="checkbox" checked={blockWarmup} onChange={(e) => setBlockWarmup(e.target.checked)} />
@@ -396,7 +425,7 @@ export default function DayEditor({ exercises, exerciseMeta, day, onChange, onCl
               onChange={(e) => setBlockNote(e.target.value)}
             />
 
-            <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
+            <div className="g-block-actions">
               {editingItemIdx !== null && (
                 <button className="g-icon-btn" style={{ padding: "10px 14px" }} onClick={clearBlockForm}>
                   Annulla
