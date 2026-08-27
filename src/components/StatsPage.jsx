@@ -356,7 +356,7 @@ export default function StatsPage({
           disabled={exporting}
           title="Scarica PDF"
         >
-          <FileDown size={15} /> {exporting ? "..." : "PDF"}
+          <FileDown size={15} color="var(--accent)" /> {exporting ? "..." : "PDF"}
         </button>
       </div>
 

@@ -9,6 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@bryllim/workout-guide": "^1.0.0",
     "firebase": "^10.12.0",
     "jspdf": "^2.5.1",
     "jspdf-autotable": "^3.8.2",

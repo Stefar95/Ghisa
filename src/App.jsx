@@ -18,6 +18,7 @@ const EX_KEY = "ghisa-exercises";
 const LOG_KEY = "ghisa-logs";
 const SCHEDE_KEY = "ghisa-schede";
 const EX_META_KEY = "ghisa-exercise-meta";
+const EX_GUIDE_KEY = "ghisa-exercise-guide";
 const DRAFT_KEY = "ghisa-draft-session";
 const ACTIVE_KEY = "ghisa-active-scheda";
 
@@ -27,6 +28,9 @@ export default function App() {
   const [logs, setLogs] = useState([]);
   const [schede, setSchede] = useState([]);
   const [exerciseMeta, setExerciseMeta] = useState({});
+  // Collegamento (facoltativo) tra un esercizio e lo slug della guida esterna
+  // scelto da un admin/PT: { [esercizio]: slug }
+  const [exerciseGuide, setExerciseGuide] = useState({});
   const [draftSession, setDraftSession] = useState(null);
   const [activeSchedaId, setActiveSchedaId] = useState(null);
   const [authUser, setAuthUser] = useState(null);
@@ -207,6 +211,7 @@ export default function App() {
   // Caricamento iniziale da localStorage: veloce, e funziona anche senza login/offline
   useEffect(() => {
     let ex = [];
+    let guide = {};
     let lg = [];
     let sc = [];
     let meta = {};
@@ -237,6 +242,12 @@ export default function App() {
       /* nessun dato salvato ancora */
     }
     try {
+      const raw = localStorage.getItem(EX_GUIDE_KEY);
+      if (raw) guide = JSON.parse(raw);
+    } catch (e) {
+      /* nessun dato salvato ancora */
+    }
+    try {
       const raw = localStorage.getItem(DRAFT_KEY);
       if (raw) draft = JSON.parse(raw);
     } catch (e) {
@@ -252,6 +263,7 @@ export default function App() {
     setLogs(lg);
     setSchede(sc);
     setExerciseMeta(meta);
+    setExerciseGuide(guide);
     setDraftSession(draft);
     setActiveSchedaId(active);
     setLoading(false);
@@ -273,6 +285,10 @@ export default function App() {
           if (data.exerciseMeta && typeof data.exerciseMeta === "object") {
             setExerciseMeta(data.exerciseMeta);
             try { localStorage.setItem(EX_META_KEY, JSON.stringify(data.exerciseMeta)); } catch (e) {}
+          }
+          if (data.exerciseGuide && typeof data.exerciseGuide === "object") {
+            setExerciseGuide(data.exerciseGuide);
+            try { localStorage.setItem(EX_GUIDE_KEY, JSON.stringify(data.exerciseGuide)); } catch (e) {}
           }
         }
       },
@@ -344,12 +360,14 @@ export default function App() {
         setSaveError(true);
       }
 
-      if (key === EX_KEY || key === EX_META_KEY) {
+      if (key === EX_KEY || key === EX_META_KEY || key === EX_GUIDE_KEY) {
         // Anagrafica condivisa: unica per tutti. Chiunque sia autenticato può
         // aggiungere esercizi (anche creando una scheda), così l'elenco resta
         // lo stesso per admin, personal trainer e utenti normali.
         if (!authUser) return;
-        const field = key === EX_KEY ? "exercises" : "exerciseMeta";
+        const field =
+          key === EX_KEY ? "exercises" :
+          key === EX_META_KEY ? "exerciseMeta" : "exerciseGuide";
         setDoc(doc(db, "shared", "registry"), { [field]: value }, { merge: true }).catch((e) =>
           console.error(e)
         );
@@ -531,8 +549,10 @@ export default function App() {
     if (targets.includes("esercizi")) {
       setExercises([]);
       setExerciseMeta({});
+      setExerciseGuide({});
       clear(EX_KEY);
       clear(EX_META_KEY);
+      clear(EX_GUIDE_KEY);
     }
     if (targets.includes("allenamenti")) {
       setLogs([]);
@@ -582,6 +602,33 @@ export default function App() {
     [persist]
   );
 
+  // Collega/scollega la guida esterna (slug di @bryllim/workout-guide) scelta
+  // da un admin/PT per un esercizio: da quel momento chi la apre in
+  // Allenamento vede subito l'immagine giusta, senza dover cercare.
+  const setExerciseGuideSlug = useCallback(
+    (name, slug) => {
+      setExerciseGuide((prev) => {
+        const next = { ...prev, [name]: slug };
+        persist(EX_GUIDE_KEY, next);
+        return next;
+      });
+    },
+    [persist]
+  );
+
+  const clearExerciseGuideSlug = useCallback(
+    (name) => {
+      setExerciseGuide((prev) => {
+        if (!(name in prev)) return prev;
+        const next = { ...prev };
+        delete next[name];
+        persist(EX_GUIDE_KEY, next);
+        return next;
+      });
+    },
+    [persist]
+  );
+
   const mergeExercises = useCallback(
     (namesToMerge, keepName) => {
       const toReplace = namesToMerge.filter((n) => n !== keepName);
@@ -620,6 +667,19 @@ export default function App() {
         toReplace.forEach((n) => delete next[n]);
         next[keepName] = Array.from(merged);
         persist(EX_META_KEY, next);
+        return next;
+      });
+
+      setExerciseGuide((prev) => {
+        // Tiene la guida di keepName se già c'è, altrimenti quella del primo
+        // esercizio unito che ne aveva una
+        const kept = prev[keepName] ?? toReplace.map((n) => prev[n]).find((s) => s);
+        if (kept === undefined && !toReplace.some((n) => n in prev)) return prev;
+        const next = { ...prev };
+        toReplace.forEach((n) => delete next[n]);
+        if (kept) next[keepName] = kept;
+        else delete next[keepName];
+        persist(EX_GUIDE_KEY, next);
         return next;
       });
     },
@@ -667,6 +727,15 @@ export default function App() {
         next[newName] = prev[oldName];
         delete next[oldName];
         persist(EX_META_KEY, next);
+        return next;
+      });
+
+      setExerciseGuide((prev) => {
+        if (!prev[oldName]) return prev;
+        const next = { ...prev };
+        next[newName] = prev[oldName];
+        delete next[oldName];
+        persist(EX_GUIDE_KEY, next);
         return next;
       });
     },
@@ -783,6 +852,7 @@ export default function App() {
           --line: #33383f;
           --success: #8fb996;
           --steel: #7c8b99;
+          --steel-dim: rgba(124, 139, 153, 0.16);
           background: var(--bg);
           color: var(--ink);
           font-family: 'Inter', sans-serif;
@@ -802,6 +872,7 @@ export default function App() {
           --line: #d8d1bd;
           --success: #3f7a4c;
           --steel: #5c6773;
+          --steel-dim: rgba(92, 103, 115, 0.12);
         }
         .ghisa-root * { box-sizing: border-box; min-width: 0; transition: background 0.2s ease, border-color 0.2s ease; }
 
@@ -1190,7 +1261,7 @@ export default function App() {
         .g-tag-warm { background: rgba(214,158,46,0.16); color: #d69e2e; border-color: rgba(214,158,46,0.4); }
         .g-tag-link { background: rgba(124,139,153,0.18); color: var(--steel); border-color: var(--steel); }
         .g-ex-note {
-          margin-top: 10px; padding: 8px 10px; border-radius: 8px;
+          margin: 10px 0 12px; padding: 8px 10px; border-radius: 8px;
           background: var(--surface-2); border-left: 3px solid var(--accent);
           font-size: 12.5px; color: var(--ink); line-height: 1.4; font-style: italic;
         }
@@ -1204,9 +1275,14 @@ export default function App() {
         .g-ex-tags { margin-top: 6px; display: flex; flex-wrap: wrap; align-items: center; gap: 5px; }
         .g-ex-tags .g-tag { margin-right: 0; }
 
-        .g-seg { display: flex; gap: 6px; }
+        /* Riga che va a capo solo se serve: con 4 opzioni (Ripetizioni/A tempo/
+           A sfinimento/Cardio) stanno su una riga sola quando c'è spazio (es.
+           tablet), e vanno automaticamente su due righe quando lo schermo è
+           stretto, invece di schiacciarsi. Con 2 sole opzioni (es. "Serie
+           uguali"/"Serie diverse") restano sempre affiancate. */
+        .g-seg { display: flex; flex-wrap: wrap; gap: 6px; }
         .g-seg-btn {
-          flex: 1; padding: 9px 4px; border-radius: 9px; border: 1px solid var(--line);
+          flex: 1 1 105px; padding: 9px 4px; border-radius: 9px; border: 1px solid var(--ink-dim);
           background: var(--surface-2); color: var(--ink-dim); font-size: 12px; font-weight: 600;
           cursor: pointer; white-space: nowrap;
         }
@@ -1217,7 +1293,7 @@ export default function App() {
         .g-combo-choice-row { display: flex; gap: 8px; }
         .g-combo-choice {
           flex: 1; display: flex; flex-direction: column; align-items: center; gap: 2px;
-          padding: 8px 10px; border-radius: 9px; border: 1px solid var(--line);
+          padding: 8px 10px; border-radius: 9px; border: 1px solid var(--ink-dim);
           background: var(--surface-2); color: var(--ink-dim); cursor: pointer; text-align: center;
         }
         .g-combo-choice.active { border-color: var(--accent); background: var(--accent-dim); }
@@ -1477,19 +1553,21 @@ export default function App() {
         .g-scheda-name { font-weight: 600; font-size: 15.5px; }
         .g-scheda-meta { font-size: 12px; color: var(--ink-dim); margin-top: 3px; }
         .g-icon-btn {
-          background: var(--surface-2); border: 1px solid var(--line); color: var(--ink-dim);
+          background: var(--surface-2); border: 1px solid var(--ink-dim); color: var(--ink-dim);
           border-radius: 8px; padding: 7px; cursor: pointer; display: flex; align-items: center;
         }
         .g-icon-btn:hover { color: var(--ink); }
         .g-icon-btn:disabled { opacity: 0.35; cursor: not-allowed; }
 
         .g-draft-item {
-          display: flex; align-items: center; justify-content: space-between;
-          background: var(--surface-2); border-radius: 8px; padding: 8px 10px; margin-bottom: 6px;
-          font-size: 13px;
+          display: flex; align-items: center; gap: 8px;
+          background: var(--surface-2); border: 1px solid var(--line);
+          border-radius: 10px; padding: 10px 10px; margin-bottom: 8px;
+          font-size: 13.5px;
         }
-        .g-draft-item-active { border: 1px solid var(--accent); }
-        .g-draft-item-moving { opacity: 0.55; border: 1px dashed var(--accent); }
+        .g-draft-item-active { border-color: var(--accent); }
+        .g-draft-item-moving { opacity: 0.55; border-style: dashed; border-color: var(--accent); }
+        .g-draft-grip { padding: 8px; flex-shrink: 0; cursor: grab; }
         .g-move-bar {
           display: flex; align-items: center; justify-content: space-between; gap: 8px;
           background: var(--accent-dim); border: 1px solid var(--accent); border-radius: 8px;
@@ -1504,31 +1582,63 @@ export default function App() {
         }
         .g-move-slot:hover { background: var(--accent-dim); }
 
-        /* "Aggiungi giorno" / "Aggiungi esercizio abbinato": stesso trattamento,
-           colore secondario del sito (--steel) invece del grigio neutro */
+        /* "Aggiungi giorno" / "Aggiungi esercizio": stesso trattamento, colore
+           secondario del sito (--steel). Sfondo tinteggiato + bordo pieno
+           (non più tratteggiato trasparente) perché si veda bene anche su
+           schermi piccoli o con poca luce. */
         .g-add-btn {
           display: flex; align-items: center; justify-content: center; gap: 6px;
-          width: 100%; padding: 9px; margin-top: 6px;
-          background: none; border: 1px dashed var(--steel); border-radius: 9px;
-          color: var(--steel); font-size: 13px; font-weight: 600; cursor: pointer;
+          width: 100%; padding: 10px; margin-top: 6px;
+          background: var(--steel-dim); border: 1.5px solid var(--steel); border-radius: 9px;
+          color: var(--steel); font-size: 13px; font-weight: 700; cursor: pointer;
         }
-        .g-add-btn:hover { opacity: 0.8; }
+        .g-add-btn:hover { opacity: 0.85; }
 
         .g-spin { animation: g-spin 0.9s linear infinite; }
         @keyframes g-spin { to { transform: rotate(360deg); } }
 
-        .g-block-form {
-          margin-top: 16px; padding: 14px; border-radius: 14px;
-          background: var(--surface-2); border: 1px solid var(--line);
-        }
         .g-part-card {
-          background: var(--surface); border: 1px solid var(--line);
+          background: var(--surface-2); border: 1px solid var(--line);
           border-radius: 10px; padding: 12px; margin-bottom: 8px;
         }
-        .g-part-card .g-input, .g-part-card .g-duration-input { background: var(--surface-2); }
+        .g-part-card .g-input, .g-part-card .g-duration-input { background: var(--surface); }
+
+        /* Bottone "Opzioni avanzate": intestazione a fisarmonica per i campi
+           meno usati (back-off, superset/jumpset, riscaldamento, note). Tenerli
+           chiusi di default snellisce di molto il form nel caso più comune
+           (un solo esercizio, senza back-off). */
+        .g-accordion-toggle {
+          display: flex; align-items: center; gap: 8px; width: 100%;
+          margin-top: 16px; padding: 11px 12px; border-radius: 10px;
+          background: var(--surface-2); border: 1px solid var(--line);
+          color: var(--ink); font-size: 13px; font-weight: 600; cursor: pointer;
+          text-align: left;
+        }
+        .g-accordion-summary {
+          flex: 1; min-width: 0; font-weight: 400; font-size: 11.5px; color: var(--ink-dim);
+          overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right;
+        }
+        .g-accordion-arrow { flex-shrink: 0; color: var(--ink-dim); transition: transform 0.15s; }
+        .g-accordion-arrow-open { transform: rotate(180deg); }
+        .g-accordion-body {
+          margin-top: 10px; padding: 12px; border-radius: 10px;
+          background: var(--surface-2); border: 1px solid var(--line);
+        }
+        .g-accordion-body .g-part-card { background: var(--surface); }
+        .g-accordion-body .g-part-card .g-input,
+        .g-accordion-body .g-part-card .g-duration-input { background: var(--surface-2); }
+        .g-accordion-divider { height: 1px; background: var(--line); margin: 16px 0; }
+
+        /* Barra di salvataggio del blocco: resta ancorata in fondo allo
+           schermo così è sempre raggiungibile senza scorrere fino in fondo,
+           anche quando le opzioni avanzate sono aperte. */
         .g-block-actions {
-          display: flex; gap: 8px; margin-top: 16px; padding-top: 14px;
-          border-top: 1px solid var(--line);
+          position: sticky; bottom: 0; z-index: 5;
+          display: flex; gap: 8px; margin: 20px -18px -18px -18px; padding: 12px 18px;
+          padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+          background: var(--surface); border-top: 1px solid var(--line);
+          border-radius: 0 0 14px 14px;
+          box-shadow: 0 -8px 18px -10px rgba(0,0,0,0.35);
         }
 
         .g-set-row {
@@ -1579,8 +1689,8 @@ export default function App() {
         }
         .g-toggle-pill.active::before { background: var(--accent); }
         .g-order-btn {
-          background: none; border: none; color: var(--ink-dim); font-size: 9px; cursor: pointer;
-          padding: 1px 4px; line-height: 1;
+          background: none; border: none; color: var(--ink-dim); font-size: 11px; cursor: pointer;
+          padding: 6px 8px; line-height: 1; touch-action: manipulation;
         }
         .g-order-btn:hover { color: var(--ink); }
         .g-order-btn:disabled { opacity: 0.25; cursor: not-allowed; }
@@ -1592,6 +1702,12 @@ export default function App() {
           font-size: 12.5px; color: var(--ink-dim); cursor: pointer;
         }
         .g-checkbox-row input { width: 16px; height: 16px; accent-color: var(--accent); flex-shrink: 0; }
+
+        /* Gruppo di checkbox (Corpo libero / Back-off / Riscaldamento): stanno
+           affiancate su una riga sola quando c'è spazio, e vanno a capo una
+           per una quando lo schermo è troppo stretto per contenerle tutte. */
+        .g-checkbox-group { display: flex; flex-wrap: wrap; column-gap: 20px; row-gap: 4px; }
+        .g-checkbox-group .g-checkbox-row { width: auto; flex: 0 0 auto; }
 
         .g-info-btn {
           position: absolute; top: 20px; right: 20px;
@@ -1693,6 +1809,10 @@ export default function App() {
           <LogPage
             exercises={exercises}
             exerciseMeta={exerciseMeta}
+            exerciseGuide={exerciseGuide}
+            canManageGuide={isStaff}
+            onSetGuide={setExerciseGuideSlug}
+            onClearGuide={clearExerciseGuideSlug}
             logs={logs}
             schede={schede}
             onAddBatch={addLogsBatch}
@@ -1724,6 +1844,9 @@ export default function App() {
           <AdminPage
             exercises={exercises}
             exerciseMeta={exerciseMeta}
+            exerciseGuide={exerciseGuide}
+            onSetGuide={setExerciseGuideSlug}
+            onClearGuide={clearExerciseGuideSlug}
             logs={logs}
             totalLogCounts={totalLogCounts}
             totalsLoading={totalsLoading}

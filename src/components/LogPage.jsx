@@ -11,6 +11,7 @@ import {
   Pause,
   RotateCcw,
   X,
+  BookOpen,
 } from "lucide-react";
 import {
   uid, confirmThen, todayISO, formatDate, formatMMSS, STEPS,
@@ -22,6 +23,7 @@ import {
 import BodyDiagram from "./BodyDiagram";
 import ExercisePicker from "./ExercisePicker";
 import DurationField from "./DurationField";
+import ExerciseGuideModal from "./ExerciseGuideModal";
 
 // Timer compatto per la pausa tra gli esercizi di un jumpset
 function MiniTimer({ seconds }) {
@@ -81,7 +83,10 @@ function MiniTimer({ seconds }) {
   );
 }
 
-export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBatch, onDelete, onDeleteBatch, onUpdate, draft, onSaveDraft, activeSchedaId }) {
+export default function LogPage({
+  exercises, exerciseMeta, exerciseGuide = {}, canManageGuide, onSetGuide, onClearGuide,
+  logs, schede, onAddBatch, onDelete, onDeleteBatch, onUpdate, draft, onSaveDraft, activeSchedaId,
+}) {
   const [dayId, setDayId] = useState(() => (draft ? draft.dayId : null));
   // Prima si sceglie la scheda (di default quella attiva), poi il giorno
   const [schedaSel, setSchedaSel] = useState(null);
@@ -144,6 +149,10 @@ export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBa
   }, [alarmOn]);
   const [completed, setCompleted] = useState(false);
   const [showBodyDiagram, setShowBodyDiagram] = useState(false);
+  // Nome dell'esercizio di cui sto guardando la guida (o null): la modale è
+  // la stessa dell'anagrafica, letta qui in sola visualizzazione a meno di
+  // essere admin/PT (allora si può collegare/correggere la guida al volo).
+  const [guideFor, setGuideFor] = useState(null);
 
   // In allenamento uso solo le schede mie: quelle passate ad altri non contano
   const mieSchede = useMemo(
@@ -847,8 +856,18 @@ export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBa
                     {multiplo && (
                       <div className="g-part-block-head">
                         <span className="g-part-block-name">{part.exercise}</span>
-                        <span className="g-tag g-tag-target">
-                          {aCardio ? formatMMSS(q.max) : `${nSerie}x${repsLabel(q.min, q.max)}${aTempo ? "s" : ""}`}
+                        <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                          <button
+                            className="g-parts-link"
+                            onClick={() => setGuideFor(part.exercise)}
+                            title="Guida esercizio"
+                            aria-label="Guida esercizio"
+                          >
+                            <BookOpen size={13} color={exerciseGuide[part.exercise] ? "var(--success)" : undefined} />
+                          </button>
+                          <span className="g-tag g-tag-target">
+                            {aCardio ? formatMMSS(q.max) : `${nSerie}x${repsLabel(q.min, q.max)}${aTempo ? "s" : ""}`}
+                          </span>
                         </span>
                       </div>
                     )}
@@ -857,6 +876,14 @@ export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBa
                         <span className="g-tag g-tag-target">
                           {aCardio ? formatMMSS(q.max) : `${nSerie}x${repsLabel(q.min, q.max)}${aTempo ? "s" : ""}`}
                         </span>
+                        <button
+                          className="g-parts-link g-tag"
+                          onClick={() => setGuideFor(part.exercise)}
+                          title="Guida esercizio"
+                        >
+                          <BookOpen size={11} color={exerciseGuide[part.exercise] ? "var(--success)" : undefined} style={{ verticalAlign: "-1px", marginRight: 3 }} />
+                          Guida
+                        </button>
                         {parti.length > 0 && (
                           <button className="g-parts-link g-tag" onClick={() => setShowBodyDiagram((b) => !b)}>
                             {parti.join(", ")}{showBodyDiagram ? " ▲" : " ▼"}
@@ -1032,7 +1059,18 @@ export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBa
           </>
         ) : (
           <>
-            <label className="g-field-label">Esercizio</label>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <label className="g-field-label" style={{ marginBottom: 6 }}>Esercizio</label>
+              {exerciseInput.trim() && (
+                <button
+                  className="g-parts-link"
+                  style={{ fontSize: 11, display: "flex", alignItems: "center", gap: 3, marginBottom: 6 }}
+                  onClick={() => setGuideFor(exerciseInput.trim())}
+                >
+                  <BookOpen size={12} color={exerciseGuide[exerciseInput.trim()] ? "var(--success)" : undefined} /> Guida
+                </button>
+              )}
+            </div>
             <ExercisePicker exercises={exercises} value={exerciseInput} onChange={setExerciseInput} placeholder="" />
 
             <div className="g-seg" style={{ marginTop: 12 }}>
@@ -1220,6 +1258,7 @@ export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBa
 
         <button
           className="g-submit g-submit-secondary"
+          style={!selectedScheda ? { marginTop: 16 } : undefined}
           disabled={selectedScheda ? activeParts.length === 0 : !exerciseInput.trim()}
           onClick={addToSession}
         >
@@ -1588,6 +1627,17 @@ export default function LogPage({ exercises, exerciseMeta, logs, schede, onAddBa
           </div>
         )}
       </div>
+
+      {guideFor && (
+        <ExerciseGuideModal
+          exerciseName={guideFor}
+          savedSlug={exerciseGuide[guideFor]}
+          canManage={canManageGuide}
+          onSelect={(slug) => onSetGuide && onSetGuide(guideFor, slug)}
+          onClear={() => onClearGuide && onClearGuide(guideFor)}
+          onClose={() => setGuideFor(null)}
+        />
+      )}
     </div>
   );
 }

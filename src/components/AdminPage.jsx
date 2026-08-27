@@ -7,6 +7,9 @@ import DatabaseCleanup from "./DatabaseCleanup";
 export default function AdminPage({
   exercises,
   exerciseMeta,
+  exerciseGuide,
+  onSetGuide,
+  onClearGuide,
   logs,
   totalLogCounts,
   totalsLoading,
@@ -94,6 +97,9 @@ export default function AdminPage({
         <ExerciseRegistry
           exercises={exercises}
           exerciseMeta={exerciseMeta}
+          exerciseGuide={exerciseGuide}
+          onSetGuide={onSetGuide}
+          onClearGuide={onClearGuide}
           logs={logs}
           totalLogCounts={totalLogCounts}
           totalsLoading={totalsLoading}

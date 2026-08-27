@@ -1,11 +1,12 @@
 import { useState, useMemo } from "react";
-import { Dumbbell, Trash2, Plus, Pencil, X, Search, RefreshCw } from "lucide-react";
+import { Dumbbell, Trash2, Plus, Pencil, X, Search, RefreshCw, BookOpen } from "lucide-react";
 import { confirmThen, BODY_PARTS, SEARCH_MIN_CHARS } from "../lib/utils";
 import BodyDiagram from "./BodyDiagram";
+import ExerciseGuideModal from "./ExerciseGuideModal";
 
 export default function ExerciseRegistry({
-  exercises, exerciseMeta, totalLogCounts = {}, totalsLoading, onRefreshTotals,
-  onAdd, onRemove, onMerge, onRename, onSetBodyParts,
+  exercises, exerciseMeta, exerciseGuide = {}, totalLogCounts = {}, totalsLoading, onRefreshTotals,
+  onAdd, onRemove, onMerge, onRename, onSetBodyParts, onSetGuide, onClearGuide,
 }) {
   const [name, setName] = useState("");
   const [search, setSearch] = useState("");
@@ -68,6 +69,7 @@ export default function ExerciseRegistry({
   };
 
   const [bodyPartsOpenFor, setBodyPartsOpenFor] = useState(null);
+  const [guideFor, setGuideFor] = useState(null);
 
   const toggleBodyPart = (ex, part) => {
     const current = exerciseMeta[ex] || [];
@@ -128,7 +130,7 @@ export default function ExerciseRegistry({
       )}
 
       <div style={{ marginTop: 16 }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
           <div className="g-field-label">
             Anagrafica ({visibleExercises.length}{search.trim().length >= SEARCH_MIN_CHARS ? ` di ${exercises.length}` : ""})
           </div>
@@ -214,6 +216,14 @@ export default function ExerciseRegistry({
                     <div style={{ display: "flex", gap: 4 }}>
                       <button
                         className="g-del-btn"
+                        onClick={() => setGuideFor(ex)}
+                        aria-label="Guida esercizio"
+                        title={exerciseGuide[ex] ? "Guida collegata" : "Collega guida esercizio"}
+                      >
+                        <BookOpen size={15} color={exerciseGuide[ex] ? "var(--success)" : undefined} />
+                      </button>
+                      <button
+                        className="g-del-btn"
                         onClick={() => setBodyPartsOpenFor(bodyPartsOpenFor === ex ? null : ex)}
                         aria-label="Parti del corpo"
                       >
@@ -260,6 +270,17 @@ export default function ExerciseRegistry({
           </div>
         )}
       </div>
+
+      {guideFor && (
+        <ExerciseGuideModal
+          exerciseName={guideFor}
+          savedSlug={exerciseGuide[guideFor]}
+          canManage
+          onSelect={(slug) => onSetGuide && onSetGuide(guideFor, slug)}
+          onClear={() => onClearGuide && onClearGuide(guideFor)}
+          onClose={() => setGuideFor(null)}
+        />
+      )}
     </div>
   );
 }

@@ -49,14 +49,18 @@ src/
 ├── lib/
 │   ├── utils.js            uid, confirmThen, formatDate, formatMMSS, BODY_PARTS, STEPS,
 │   │                       getReps/getBackoffReps/getBackoffPercent/repsLabel
-│   └── exporters.js        export scheda in xlsx/PDF, export statistiche in PDF
+│   ├── exporters.js        export scheda in xlsx/PDF, export statistiche in PDF
+│   └── exerciseGuideIt.js  traduzioni IT per la guida esterna @bryllim/workout-guide
+│                           (nomi/attrezzi/muscoli: dizionario statico, non generato al volo)
 └── components/
     ├── StatsPage.jsx       tab Statistiche (per esercizio / per giorno) + export PDF
     ├── LogPage.jsx         tab Allenamento (il file più grande e delicato)
     ├── SchedeManager.jsx   tab Schede: elenco schede e gestione giorni
     ├── DayEditor.jsx       editor di un singolo giorno (blocchi ed esercizi)
     ├── AdminPage.jsx       tab Admin: sotto-sezioni Esercizi / Utenti / Pulizia
-    ├── ExerciseRegistry.jsx anagrafica esercizi (rinomina, unisci, parti del corpo)
+    ├── ExerciseRegistry.jsx anagrafica esercizi (rinomina, unisci, parti del corpo, guida)
+    ├── ExerciseGuideModal.jsx guida esterna con immagini (@bryllim/workout-guide, lazy-loaded);
+    │                         usata sia dall'Anagrafica sia da Allenamento
     ├── UserManagement.jsx  elenco utenti + assegnazione ruolo Personal Trainer
     ├── DatabaseCleanup.jsx pulizia selettiva del database (solo admin)
     ├── ExercisePicker.jsx  campo ricerca esercizio con "Non lo trovi? Inserisci..."
@@ -78,7 +82,7 @@ lì e usa le variabili, non colori fissi.
 
 | Percorso | Contenuto | Chi può |
 |---|---|---|
-| `shared/registry` | `exercises: string[]`, `exerciseMeta: { [esercizio]: string[] }` (parti del corpo) | lettura pubblica, scrittura a chiunque sia autenticato — **è l'anagrafica unica per tutti** |
+| `shared/registry` | `exercises: string[]`, `exerciseMeta: { [esercizio]: string[] }` (parti del corpo), `exerciseGuide: { [esercizio]: slug }` (guida esterna collegata, scelta da admin/PT) | lettura pubblica, scrittura a chiunque sia autenticato — **è l'anagrafica unica per tutti** |
 | `users/{uid}` | `logs`, `schede`, `draftSession` | scrittura solo proprietario + admin; **lettura anche PT** (serve per il conteggio totale allenamenti in Anagrafica) — dati **privati per utente** |
 | `directory/{uid}` | `email`, `displayName`, `lastSeen`, `isPT` | il proprietario + admin |
 

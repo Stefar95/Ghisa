@@ -291,10 +291,10 @@ export default function SchedeManager({
                           )}
                           <div className="g-menu-divider" />
                           <button className="g-menu-item" onClick={() => { exportSchedaXLSX(s, exerciseMeta); setMenuFor(null); }}>
-                            <FileSpreadsheet size={14} /> Scarica Excel
+                            <FileSpreadsheet size={14} color="var(--success)" /> Scarica Excel
                           </button>
                           <button className="g-menu-item" onClick={() => { exportSchedaPDF(s, exerciseMeta); setMenuFor(null); }}>
-                            <FileDown size={14} /> Scarica PDF
+                            <FileDown size={14} color="var(--accent)" /> Scarica PDF
                           </button>
                           <button className="g-menu-item" onClick={() => { duplicate(s); setMenuFor(null); }}>
                             <Copy size={14} /> Duplica
@@ -381,10 +381,10 @@ export default function SchedeManager({
                         )}
                         <div className="g-menu-divider" />
                         <button className="g-menu-item" onClick={() => { exportSchedaXLSX(s, exerciseMeta); setMenuFor(null); }}>
-                          <FileSpreadsheet size={14} /> Scarica Excel
+                          <FileSpreadsheet size={14} color="var(--success)" /> Scarica Excel
                         </button>
                         <button className="g-menu-item" onClick={() => { exportSchedaPDF(s, exerciseMeta); setMenuFor(null); }}>
-                          <FileDown size={14} /> Scarica PDF
+                          <FileDown size={14} color="var(--accent)" /> Scarica PDF
                         </button>
                         <button className="g-menu-item" onClick={() => { duplicate(s); setMenuFor(null); }}>
                           <Copy size={14} /> Duplica
