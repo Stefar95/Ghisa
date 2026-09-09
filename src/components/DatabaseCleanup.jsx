@@ -54,17 +54,20 @@ export default function DatabaseCleanup({ onLocalWipe }) {
         done.push("esercizi");
       }
 
-      if (selected.includes("allenamenti") || selected.includes("schede")) {
+      if (selected.includes("allenamenti")) {
         const snap = await getDocs(collection(db, "users"));
-        const patch = {};
-        if (selected.includes("allenamenti")) {
-          patch.logs = [];
-          patch.draftSession = null;
-        }
-        if (selected.includes("schede")) patch.schede = [];
-        await Promise.all(snap.docs.map((d) => setDoc(d.ref, patch, { merge: true })));
-        if (selected.includes("allenamenti")) done.push("allenamenti");
-        if (selected.includes("schede")) done.push("schede");
+        await Promise.all(
+          snap.docs.map((d) => setDoc(d.ref, { logs: [], draftSession: null }, { merge: true }))
+        );
+        done.push("allenamenti");
+      }
+
+      if (selected.includes("schede")) {
+        // Le schede vivono in una collection a sé (un documento per scheda,
+        // non più dentro users/{uid}): si eliminano i documenti stessi.
+        const snap = await getDocs(collection(db, "schede"));
+        await Promise.all(snap.docs.map((d) => deleteDoc(d.ref)));
+        done.push("schede");
       }
 
       if (selected.includes("utenti")) {

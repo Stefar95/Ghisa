@@ -1,17 +1,18 @@
 import { useState, useEffect, useRef } from "react";
 import {
-  Trash2, Plus, Pencil, X, FileSpreadsheet, FileDown, Copy, Send, Inbox,
-  CalendarDays, ChevronLeft, ChevronRight, ChevronDown, MoreVertical, Star, CheckCircle2, UserCheck, Undo2,
+  Trash2, Plus, Pencil, X, FileSpreadsheet, FileDown, Copy, Send,
+  CalendarDays, ChevronLeft, ChevronRight, ChevronDown, MoreVertical, Star, CheckCircle2, UserCheck, Undo2, LogOut, History,
 } from "lucide-react";
 import { uid, confirmThen, getDays, makeDay, blockTitle } from "../lib/utils";
 import { exportSchedaXLSX, exportSchedaPDF } from "../lib/exporters";
 import AssignSchedaModal from "./AssignSchedaModal";
 import DayEditor from "./DayEditor";
 import DuplicateSchedaModal from "./DuplicateSchedaModal";
+import SchedaHistoryModal from "./SchedaHistoryModal";
 
 export default function SchedeManager({
   exercises, exerciseMeta, schede, onAddExercise, onSaveScheda, onDeleteScheda,
-  canAssign, authUser, assignments = [], onAcceptAssignment, onRejectAssignment, onPushUpdate,
+  canAssign, authUser, onAssignScheda, onUnassignScheda,
   activeSchedaId, onSetActive,
 }) {
   const [menuFor, setMenuFor] = useState(null);
@@ -30,6 +31,7 @@ export default function SchedeManager({
   const [assigning, setAssigning] = useState(null);
   const [duplicating, setDuplicating] = useState(null);
   const [viewingSchedaId, setViewingSchedaId] = useState(null);
+  const [historyFor, setHistoryFor] = useState(null);
 
   // scheda in modifica (con i suoi giorni)
   const [editingId, setEditingId] = useState(null);
@@ -38,8 +40,12 @@ export default function SchedeManager({
   const [formOpen, setFormOpen] = useState(false);
   const [openDayIdx, setOpenDayIdx] = useState(null);
 
-  const mie = schede.filter((s) => !(s.assignedTo || []).length);
-  const assegnate = schede.filter((s) => (s.assignedTo || []).length > 0);
+  const myUid = authUser?.uid;
+  // Una scheda ricevuta da qualcun altro è lo stesso documento che vede chi
+  // l'ha creata: qui distinguo solo il gruppo in cui mostrarla, non il dato.
+  const mie = schede.filter((s) => s.ownerUid === myUid && !(s.assignedTo || []).length);
+  const assegnate = schede.filter((s) => s.ownerUid === myUid && (s.assignedTo || []).length > 0);
+  const ricevute = schede.filter((s) => s.ownerUid !== myUid);
 
   const resetForm = () => {
     setEditingId(null);
@@ -109,18 +115,19 @@ export default function SchedeManager({
     if (!name.trim() || days.length === 0) return;
     const totalEx = days.reduce((n, d) => n + (d.items?.length || 0), 0);
     // Parto dall'originale (se esiste) per non perdere campi come
-    // assignedTo/sourceSchedaId: qui si aggiornano solo nome e giorni.
+    // assignedTo/ownerUid: qui si aggiornano solo nome e giorni (onSaveScheda
+    // in App.jsx li ignora comunque per un salvataggio, ma teniamoli per pulizia).
     const original = editingId ? schede.find((s) => s.id === editingId) : null;
-    const assignedTargets = original?.assignedTo || [];
-    const pushOnSave = assignedTargets.length > 0 && !!onPushUpdate;
-    const nomiAssegnati = assignedTargets.map((t) => t.name).join(", ");
-    const message = pushOnSave
-      ? `Salvare "${name.trim()}"? La versione aggiornata verrà inviata anche a ${nomiAssegnati}, sovrascrivendo la loro copia (la cronologia resta collegata).`
+    const assignedNames = (original?.assignedTo || []).map((t) => t.name).join(", ");
+    // La scheda è un documento unico: salvando qui, chi ce l'ha assegnata (o
+    // a cui l'abbiamo assegnata) vede subito la stessa versione — nessun
+    // invio separato da confermare.
+    const message = assignedNames
+      ? `Salvare "${name.trim()}"? Le modifiche saranno visibili subito anche a ${assignedNames}.`
       : `Salvare la scheda "${name.trim()}" con ${days.length} ${days.length === 1 ? "giorno" : "giorni"} e ${totalEx} esercizi?`;
     confirmThen(message, () => {
       const updated = { ...original, id: editingId || uid(), name: name.trim(), days };
       onSaveScheda(updated);
-      if (pushOnSave) onPushUpdate(updated);
       resetForm();
     });
   };
@@ -202,31 +209,6 @@ export default function SchedeManager({
 
   return (
     <div>
-      {assignments.length > 0 && (
-        <div style={{ marginBottom: 16 }}>
-          {assignments.map((a) => (
-            <div className="g-assign-banner" key={a.id}>
-              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <Inbox size={16} />
-                <div>
-                  <div style={{ fontWeight: 600, fontSize: 13.5 }}>{a.scheda?.name}</div>
-                  <div style={{ fontSize: 11.5, color: "var(--ink-dim)" }}>
-                    Assegnata da {a.fromName}
-                  </div>
-                </div>
-              </div>
-              <div style={{ display: "flex", gap: 6 }}>
-                <button className="g-del-btn" onClick={() => onRejectAssignment(a)}>Rifiuta</button>
-                <button className="g-empty-cta" style={{ marginTop: 0, padding: "7px 14px" }}
-                  onClick={() => onAcceptAssignment(a)}>
-                  Aggiungi
-                </button>
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-
       <button className="g-empty-cta" style={{ width: "100%", marginBottom: 16 }} onClick={startNew}>
         + Nuova scheda
       </button>
@@ -298,6 +280,9 @@ export default function SchedeManager({
                           </button>
                           <button className="g-menu-item" onClick={() => { duplicate(s); setMenuFor(null); }}>
                             <Copy size={14} /> Duplica
+                          </button>
+                          <button className="g-menu-item" onClick={() => { setHistoryFor(s); setMenuFor(null); }}>
+                            <History size={14} /> Cronologia
                           </button>
                           <div className="g-menu-divider" />
                           <button
@@ -371,7 +356,15 @@ export default function SchedeManager({
                     </button>
                     {menuFor === s.id && (
                       <div className="g-menu">
-                        <button className="g-menu-item" onClick={() => { setMenuFor(null); confirmThen(`Riportare "${s.name}" tra le tue schede?`, () => onSaveScheda({ ...s, assignedTo: [] })); }}>
+                        <button
+                          className="g-menu-item"
+                          onClick={() => {
+                            setMenuFor(null);
+                            confirmThen(`Togliere l'accesso a "${s.name}" a tutte le persone a cui l'hai assegnata?`, () => {
+                              (s.assignedTo || []).forEach((t) => onUnassignScheda(s, t));
+                            });
+                          }}
+                        >
                           <Undo2 size={14} /> Riprendi tra le tue
                         </button>
                         {canAssign && (
@@ -389,6 +382,9 @@ export default function SchedeManager({
                         <button className="g-menu-item" onClick={() => { duplicate(s); setMenuFor(null); }}>
                           <Copy size={14} /> Duplica
                         </button>
+                        <button className="g-menu-item" onClick={() => { setHistoryFor(s); setMenuFor(null); }}>
+                          <History size={14} /> Cronologia
+                        </button>
                         <div className="g-menu-divider" />
                         <button className="g-menu-item g-menu-danger"
                           onClick={() => { setMenuFor(null); confirmThen(`Eliminare la scheda "${s.name}"?`, () => onDeleteScheda(s.id)); }}>
@@ -404,6 +400,86 @@ export default function SchedeManager({
         </>
       )}
 
+      {ricevute.length > 0 && (
+        <>
+          <div className="g-field-label" style={{ marginTop: 18 }}>
+            Schede ricevute ({ricevute.length})
+          </div>
+          <div className="g-card" style={{ padding: "4px 14px" }}>
+            {ricevute.map((s) => {
+              const isActive = activeSchedaId === s.id;
+              return (
+                <div className="g-scheda-row" key={s.id}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div className="g-scheda-name">
+                      {s.name}
+                      {isActive && (
+                        <span className="g-active-badge">
+                          <CheckCircle2 size={11} /> Attiva
+                        </span>
+                      )}
+                    </div>
+                    <div className="g-scheda-meta">
+                      {getDays(s).length} {getDays(s).length === 1 ? "giorno" : "giorni"} · da {s.ownerName || "qualcuno"}
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", gap: 6, alignItems: "flex-start" }}>
+                    <button className="g-icon-btn" title="Modifica" onClick={() => startEdit(s)}>
+                      <Pencil size={14} />
+                    </button>
+                    <div style={{ position: "relative" }} ref={menuFor === s.id ? menuRef : null}>
+                      <button className="g-icon-btn" title="Altre azioni"
+                        onClick={() => setMenuFor(menuFor === s.id ? null : s.id)}>
+                        <MoreVertical size={15} />
+                      </button>
+                      {menuFor === s.id && (
+                        <div className="g-menu">
+                          {!isActive && (
+                            <button className="g-menu-item" onClick={() => { onSetActive(s.id); setMenuFor(null); }}>
+                              <Star size={14} /> Rendi attiva
+                            </button>
+                          )}
+                          {isActive && (
+                            <button className="g-menu-item" onClick={() => { onSetActive(null); setMenuFor(null); }}>
+                              <Star size={14} /> Togli da attiva
+                            </button>
+                          )}
+                          <div className="g-menu-divider" />
+                          <button className="g-menu-item" onClick={() => { exportSchedaXLSX(s, exerciseMeta); setMenuFor(null); }}>
+                            <FileSpreadsheet size={14} color="var(--success)" /> Scarica Excel
+                          </button>
+                          <button className="g-menu-item" onClick={() => { exportSchedaPDF(s, exerciseMeta); setMenuFor(null); }}>
+                            <FileDown size={14} color="var(--accent)" /> Scarica PDF
+                          </button>
+                          <button className="g-menu-item" onClick={() => { duplicate(s); setMenuFor(null); }}>
+                            <Copy size={14} /> Duplica
+                          </button>
+                          <button className="g-menu-item" onClick={() => { setHistoryFor(s); setMenuFor(null); }}>
+                            <History size={14} /> Cronologia
+                          </button>
+                          <div className="g-menu-divider" />
+                          <button
+                            className="g-menu-item g-menu-danger"
+                            onClick={() => {
+                              setMenuFor(null);
+                              confirmThen(`Lasciare "${s.name}"? Resterà a chi te l'ha assegnata, ma non la vedrai più tra le tue.`, () =>
+                                onUnassignScheda(s, { uid: myUid, name: authUser?.displayName || authUser?.email || "Tu" })
+                              );
+                            }}
+                          >
+                            <LogOut size={14} /> Lascia questa scheda
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
+
       {duplicating && (
         <DuplicateSchedaModal
           scheda={duplicating}
@@ -414,18 +490,16 @@ export default function SchedeManager({
         />
       )}
 
+      {historyFor && (
+        <SchedaHistoryModal scheda={historyFor} onClose={() => setHistoryFor(null)} />
+      )}
+
       {assigning && (
         <AssignSchedaModal
           scheda={assigning}
           fromUser={authUser}
           onClose={() => setAssigning(null)}
-          onAssigned={(sch, target) => {
-            // La scheda passa alla persona: resta visibile fra le "assegnate",
-            // ma non è più selezionabile nei miei allenamenti.
-            const prevList = sch.assignedTo || [];
-            if (prevList.some((t) => t.uid === target.uid)) return;
-            onSaveScheda({ ...sch, assignedTo: [...prevList, target] });
-          }}
+          onAssign={onAssignScheda}
         />
       )}
     </div>

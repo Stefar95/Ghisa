@@ -55,15 +55,22 @@ src/
 └── components/
     ├── StatsPage.jsx       tab Statistiche (per esercizio / per giorno) + export PDF
     ├── LogPage.jsx         tab Allenamento (il file più grande e delicato)
-    ├── SchedeManager.jsx   tab Schede: elenco schede e gestione giorni
+    ├── SchedeManager.jsx   tab Schede: elenco (mie / assegnate / ricevute) e gestione giorni
     ├── DayEditor.jsx       editor di un singolo giorno (blocchi ed esercizi)
-    ├── AdminPage.jsx       tab Admin: sotto-sezioni Esercizi / Utenti / Pulizia
+    ├── AssignSchedaModal.jsx    condivide una scheda con un'altra persona (stesso documento)
+    ├── DuplicateSchedaModal.jsx crea una copia indipendente di una scheda, a sé o assegnandola
+    ├── SchedaHistoryModal.jsx   cronologia modifiche di una scheda (sola lettura)
+    ├── AdminPage.jsx       tab Admin: sotto-sezioni Esercizi / Utenti / Dati / Cancellati / Pulizia
     ├── ExerciseRegistry.jsx anagrafica esercizi (rinomina, unisci, parti del corpo, guida)
     ├── ExerciseGuideModal.jsx guida esterna con immagini (@bryllim/workout-guide, lazy-loaded);
     │                         usata sia dall'Anagrafica sia da Allenamento
     ├── UserManagement.jsx  elenco utenti + assegnazione ruolo Personal Trainer
     ├── DatabaseCleanup.jsx pulizia selettiva del database (solo admin)
+    ├── AdminDataBrowser.jsx fotografia grezza di tutti gli allenamenti (Admin → Dati)
+    ├── DeletedLogs.jsx     allenamenti cancellati, sola visualizzazione admin (Admin → Cancellati)
     ├── ExercisePicker.jsx  campo ricerca esercizio con "Non lo trovi? Inserisci..."
+    ├── SearchableSelect.jsx dropdown con ricerca, per elenchi lunghi (es. esercizi in Statistiche)
+    ├── StaffUserPicker.jsx selettore "i tuoi dati / altro utente" per admin/PT (Allenamento e Statistiche)
     ├── BodyDiagram.jsx     corpo umano fronte/retro con parti evidenziate
     ├── AccountModal.jsx    dati utente + logout
     └── InfoModal.jsx       presentazione app + link PayPal (solo admin)
@@ -83,7 +90,8 @@ lì e usa le variabili, non colori fissi.
 | Percorso | Contenuto | Chi può |
 |---|---|---|
 | `shared/registry` | `exercises: string[]`, `exerciseMeta: { [esercizio]: string[] }` (parti del corpo), `exerciseGuide: { [esercizio]: slug }` (guida esterna collegata, scelta da admin/PT) | lettura pubblica, scrittura a chiunque sia autenticato — **è l'anagrafica unica per tutti** |
-| `users/{uid}` | `logs`, `schede`, `draftSession` | scrittura solo proprietario + admin; **lettura anche PT** (serve per il conteggio totale allenamenti in Anagrafica) — dati **privati per utente** |
+| `users/{uid}` | `logs`, `draftSession`, `activeSchedaId` | scrittura solo proprietario + admin; **lettura anche PT** (serve per il conteggio totale allenamenti in Anagrafica) — dati **privati per utente** |
+| `schede/{schedaId}` | `name`, `days`, `ownerUid`, `ownerName`, `assignedTo: [{uid,name}]`, `assignedToUids: string[]`, `history` | lettura/scrittura: `ownerUid` + chiunque sia in `assignedToUids` + admin. **La scheda è UNICA**: non una copia per utente — vedi sotto |
 | `directory/{uid}` | `email`, `displayName`, `lastSeen`, `isPT` | il proprietario + admin |
 
 Ogni dato è anche in `localStorage` (chiavi `ghisa-*`) così l'app funziona offline
@@ -104,9 +112,25 @@ una lista di **blocchi**; ogni blocco contiene uno o più **esercizi**
 (superset/jumpset).
 
 ```js
-{ id, name: "Massa autunno", days: [ { id, name: "Push", items: [ /* blocchi */ ] } ] }
+{
+  id, name: "Massa autunno",
+  days: [ { id, name: "Push", items: [ /* blocchi */ ] } ],
+  ownerUid, ownerName,             // chi l'ha creata
+  assignedTo: [{ uid, name }],     // a chi è stata condivisa (oltre al proprietario)
+  assignedToUids: [uid],           // stessi uid di assignedTo, solo per poter fare where("array-contains")
+  history: [{ at, byName, summary }],  // Cronologia modifiche, in App.jsx (withSchedaHistory)
+}
 ```
 
+⚠️ **La scheda è un documento unico condiviso, non una copia per utente.**
+Assegnarla (`AssignSchedaModal`) aggiunge il destinatario a `assignedTo` /
+`assignedToUids` sullo STESSO documento: da quel momento chi la possiede e chi
+se la vede assegnata leggono/scrivono la stessa cosa, in tempo reale — nessuna
+"copia da accettare" né "invia aggiornamento" da rifare a mano. Solo `onSaveScheda`
+in App.jsx tocca `name`/`days`/`history` (mai `ownerUid`/`assignedTo`, per non
+alterare chi ci ha accesso); assegnare/rimuovere l'accesso passa da
+`onAssignScheda`/`onUnassignScheda`. "Duplica" (`DuplicateSchedaModal`) resta
+l'eccezione voluta: crea un documento nuovo e indipendente.
 ⚠️ Le schede vecchie hanno `items` al posto di `days`: usa sempre `getDays()` di
 `lib/utils.js`, che le converte in un giorno unico mantenendo id e nome (così
 storico e statistiche continuano a combaciare). `dayOptions(schede)` produce
@@ -181,6 +205,11 @@ raggruppato per sessione, non per esercizio).
   dello stesso esercizio, mai trascinato all'esercizio successivo.
 - Su Safari iOS gli input sbordavano: serve `min-width: 0` globale e
   `max-width: 100%` sugli input (già in `App.jsx`, non rimuoverli).
+- **Le schede assegnate erano una copia indipendente per utente** (accettazione →
+  duplicato con `sourceSchedaId`/`sourceDayId`, aggiornamenti da "spingere" a
+  mano): admin/PT non vedevano mai le modifiche fatte dall'utente sulla sua
+  copia, e viceversa. Risolto spostando le schede in `schede/{id}` (documento
+  unico, vedi sopra) — non tornare al modello a copie.
 
 ---
 

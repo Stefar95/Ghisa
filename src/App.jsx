@@ -1,11 +1,14 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { Dumbbell, ListChecks, BarChart3, Unlock, Info, Sun, Moon, LogIn, User } from "lucide-react";
 
 import { auth, googleProvider, db } from "./firebase";
 import { signInWithPopup, signOut, onAuthStateChanged } from "firebase/auth";
-import { doc, setDoc, onSnapshot, collection, addDoc, deleteDoc, query, where, getDocs } from "firebase/firestore";
+import {
+  doc, setDoc, updateDoc, onSnapshot, collection, deleteDoc, getDocs,
+  query, where, arrayUnion, arrayRemove,
+} from "firebase/firestore";
 import { ADMIN_EMAIL } from "./config";
-import { uid, confirmThen, getDays } from "./lib/utils";
+import { uid, confirmThen, getDays, mapSchedaExercises, withSchedaHistory } from "./lib/utils";
 
 import InfoModal from "./components/InfoModal";
 import AccountModal from "./components/AccountModal";
@@ -66,7 +69,6 @@ export default function App() {
 
   const isAdmin = !!authUser && authUser.email?.toLowerCase().trim() === ADMIN_EMAIL.toLowerCase().trim();
   const [isPT, setIsPT] = useState(false);
-  const [assignments, setAssignments] = useState([]);
   const isStaff = isAdmin || isPT;
 
   useEffect(() => {
@@ -92,8 +94,9 @@ export default function App() {
         if (!Array.isArray(userLogs)) return;
         userLogs.forEach((l) => {
           // Il back-off fa parte dello stesso allenamento del top set: contarlo
-          // a parte lo conterebbe due volte per la stessa sessione
-          if (!l?.exercise || l.backoff) return;
+          // a parte lo conterebbe due volte per la stessa sessione. Le voci
+          // cancellate (deletedAt) non vanno contate: non sono più un allenamento valido.
+          if (!l?.exercise || l.backoff || l.deletedAt) return;
           counts[l.exercise] = (counts[l.exercise] || 0) + 1;
         });
       });
@@ -116,13 +119,23 @@ export default function App() {
   const [viewingUid, setViewingUid] = useState(null);
   const [viewingLogs, setViewingLogs] = useState(null);
   const [viewingLoading, setViewingLoading] = useState(false);
+  // true = sono sul pulsante "Altro utente" (ricerca aperta o utente già
+  // scelto); false = sto guardando i miei dati. Vive qui (non nei componenti
+  // figli) perché è condiviso tra Statistiche e Allenamento.
+  const [viewingOther, setViewingOther] = useState(false);
 
+  // Il selettore "vedi di un altro utente" vale sia in Statistiche sia in
+  // Allenamento (stesso utente scelto in entrambe): si azzera solo uscendo da
+  // entrambe le tab, così cambiare tab non fa perdere la selezione.
   useEffect(() => {
-    if (view !== "stats") setViewingUid(null);
+    if (view !== "stats" && view !== "log") {
+      setViewingUid(null);
+      setViewingOther(false);
+    }
   }, [view]);
 
   useEffect(() => {
-    if (!isStaff || !authUser || view !== "stats") {
+    if (!isStaff || !authUser || (view !== "stats" && view !== "log")) {
       setStaffDirectory([]);
       return;
     }
@@ -163,7 +176,14 @@ export default function App() {
   }, [viewingUid]);
 
   const viewingUser = staffDirectory.find((u) => u.uid === viewingUid) || null;
-  const statsLogs = viewingUid ? viewingLogs || [] : logs;
+  // Le voci cancellate (deletedAt) restano nel documento ma non vanno mai
+  // mostrate in Allenamento/Statistiche: solo l'admin le vede, in Admin → Cancellati.
+  const activeLogs = useMemo(() => logs.filter((l) => !l.deletedAt), [logs]);
+  const viewingActiveLogs = useMemo(
+    () => (viewingLogs || []).filter((l) => !l.deletedAt),
+    [viewingLogs]
+  );
+  const statsLogs = viewingUid ? viewingActiveLogs : activeLogs;
 
   // Registra/aggiorna il proprio profilo nella directory utenti (email, nome,
   // ultimo accesso) e resta in ascolto del proprio ruolo (l'admin può
@@ -207,6 +227,57 @@ export default function App() {
   useEffect(() => { logsRef.current = logs; }, [logs]);
   useEffect(() => { schedeRef.current = schede; }, [schede]);
   useEffect(() => { draftRef.current = draftSession; }, [draftSession]);
+
+  // Ultimo elenco di id confermati dal cloud per i log: serve a distinguere,
+  // nel merge di protezione qui sotto, una voce mai ancora sincronizzata (da
+  // salvare) da una voce che il cloud aveva già e ora non ha più perché è
+  // stata davvero rimossa altrove (es. Admin → Cancellati → elimina per
+  // sempre): quella non va resuscitata. Le schede non ne hanno più bisogno:
+  // sono documenti scritti/letti direttamente, non un array da fondere.
+  const lastServerLogIdsRef = useRef(null);
+
+  // ⚠️ Cambio di account sullo stesso dispositivo (login, logout o switch a
+  // un altro account Google): logs/schede/bozza/scheda-attiva sono privati
+  // per utente e NON devono mai restare visibili dopo che l'account cambia.
+  // Prima di questa protezione, lo stato in memoria e il localStorage
+  // dell'account precedente restavano com'erano finché non arrivava lo
+  // snapshot del nuovo account — nel frattempo si vedevano gli allenamenti
+  // di un altro utente, e in certi casi potevano perfino essere rimandati
+  // per errore dentro il documento del nuovo account. Ora si azzera tutto
+  // SUBITO al cambio uid; l'unica eccezione è un ref "ponte" che porta
+  // avanti i dati locali solo per il primo login dell'admin su un
+  // dispositivo con dati offline da migrare (comportamento già esistente).
+  const preLoginSnapshotRef = useRef(null);
+  const prevUidRef = useRef(undefined); // undefined = stato d'auth non ancora risolto la prima volta
+  useEffect(() => {
+    const uid = authUser ? authUser.uid : null;
+    if (prevUidRef.current !== undefined && prevUidRef.current !== uid) {
+      preLoginSnapshotRef.current = {
+        logs: logsRef.current,
+        schede: schedeRef.current,
+        draftSession: draftRef.current,
+      };
+      setLogs([]);
+      setSchede([]);
+      setOwnedSchede([]);
+      setReceivedSchede([]);
+      setOwnedLoaded(false);
+      setReceivedLoaded(false);
+      setDraftSession(null);
+      setActiveSchedaId(null);
+      setViewingUid(null);
+      lastServerLogIdsRef.current = null;
+      try {
+        localStorage.removeItem(LOG_KEY);
+        localStorage.removeItem(SCHEDE_KEY);
+        localStorage.removeItem(DRAFT_KEY);
+        localStorage.removeItem(ACTIVE_KEY);
+      } catch (e) {
+        /* ignora */
+      }
+    }
+    prevUidRef.current = uid;
+  }, [authUser]);
 
   // Caricamento iniziale da localStorage: veloce, e funziona anche senza login/offline
   useEffect(() => {
@@ -300,6 +371,9 @@ export default function App() {
   // Schede, allenamenti e bozza: privati per ciascun utente che ha fatto login.
   // Senza login restano solo su questo dispositivo (localStorage), come prima.
   useEffect(() => {
+    // Ogni volta che cambia l'account (login/logout/switch) si riparte senza
+    // "memoria" di cosa fosse già sincronizzato per l'account precedente.
+    lastServerLogIdsRef.current = null;
     if (!authUser) return;
     const ref = doc(db, "users", authUser.uid);
     let didInit = false;
@@ -309,12 +383,38 @@ export default function App() {
         if (snap.exists()) {
           const data = snap.data();
           if (Array.isArray(data.logs)) {
-            setLogs(data.logs);
-            try { localStorage.setItem(LOG_KEY, JSON.stringify(data.logs)); } catch (e) {}
+            const serverIds = new Set(data.logs.map((l) => l.id));
+            const knownBefore = lastServerLogIdsRef.current;
+            setLogs((prev) => {
+              // Allenamenti presenti in locale ma non nel documento arrivato dal
+              // cloud: li tengo e li rimando subito al cloud SOLO se non erano
+              // già stati sincronizzati in precedenza (altrimenti vuol dire che
+              // sono stati rimossi davvero altrove, es. eliminazione definitiva
+              // da Admin → Cancellati, e non vanno resuscitati). Senza questa
+              // protezione, un semplice setLogs(data.logs) qui poteva cancellare
+              // allenamenti appena inseriti che non avevano ancora fatto in
+              // tempo a salvarsi (login ancora in corso, rete assente in palestra...).
+              const missing = prev.filter(
+                (l) => l.id && !serverIds.has(l.id) && !(knownBefore && knownBefore.has(l.id))
+              );
+              const merged = missing.length ? [...missing, ...data.logs] : data.logs;
+              try { localStorage.setItem(LOG_KEY, JSON.stringify(merged)); } catch (e) {}
+              if (missing.length) persist(LOG_KEY, merged);
+              return merged;
+            });
+            lastServerLogIdsRef.current = serverIds;
           }
-          if (Array.isArray(data.schede)) {
-            setSchede(data.schede);
-            try { localStorage.setItem(SCHEDE_KEY, JSON.stringify(data.schede)); } catch (e) {}
+          // Le schede non vivono più qui (vedi la sincronizzazione dedicata
+          // più sotto, sulla collection condivisa "schede"): un campo
+          // `schede` trovato qui è roba vecchia da migrare. Niente flag
+          // "già migrato" da tenere in giro: migrateLegacySchede pulisce
+          // questo campo SOLO dopo aver confermato che la scrittura nel
+          // posto nuovo è andata a buon fine, quindi finché questo campo ha
+          // qualcosa vuol dire che non ci è ancora riuscita — si ritenta ad
+          // ogni sync, in automatico, anche se un tentativo precedente si
+          // fosse fermato a metà (es. regole non ancora pubblicate).
+          if (Array.isArray(data.schede) && data.schede.length) {
+            migrateLegacySchede(data.schede);
           }
           if (data.activeSchedaId !== undefined) {
             setActiveSchedaId(data.activeSchedaId);
@@ -332,12 +432,19 @@ export default function App() {
         } else if (!didInit) {
           didInit = true;
           // Primo accesso di questo account: l'admin porta su i propri dati
-          // locali esistenti; ogni altro utente parte pulito, per non
-          // ritrovarsi con la scheda/gli allenamenti di qualcun altro.
+          // locali esistenti (quelli di prima del login, salvati nel ponte
+          // preLoginSnapshotRef appena sopra); ogni altro utente parte
+          // pulito, per non ritrovarsi con la scheda/gli allenamenti di
+          // qualcun altro che avesse usato l'app da questo stesso dispositivo.
           const isThisAdmin = authUser.email?.toLowerCase().trim() === ADMIN_EMAIL.toLowerCase().trim();
-          const initial = isThisAdmin
-            ? { logs: logsRef.current, schede: schedeRef.current, draftSession: draftRef.current }
-            : { logs: [], schede: [], draftSession: null };
+          const bridge = preLoginSnapshotRef.current;
+          // Le eventuali schede del ponte finiscono anche loro nel campo
+          // `schede` del documento appena creato: rientrano così nel percorso
+          // di migrazione qui sopra (lo scatena lo snapshot che arriva subito
+          // dopo questa scrittura), senza doverlo duplicare qui.
+          const initial = isThisAdmin && bridge
+            ? { logs: bridge.logs, draftSession: bridge.draftSession, schede: bridge.schede || [] }
+            : { logs: [], draftSession: null };
           try {
             await setDoc(ref, initial);
           } catch (e) {
@@ -348,108 +455,191 @@ export default function App() {
       (e) => console.error(e)
     );
     return unsub;
-  }, [authUser]);
+  }, [authUser]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Scrive su localStorage e, se loggato, sincronizza anche su Firestore.
+  // ⚠️ Prima questa funzione segnalava solo gli errori di localStorage:
+  // se la scrittura sul cloud falliva (connessione assente in palestra,
+  // permessi, documento troppo grande...) l'errore finiva solo nella
+  // console e l'utente non se ne accorgeva — è così che un allenamento
+  // registrato poteva sparire senza alcun avviso al giro di sync successivo.
+  // Ora il banner in cima resta acceso finché il cloud non conferma il salvataggio.
+  const syncCloud = useCallback((ref, field, value) => {
+    setDoc(ref, { [field]: value }, { merge: true })
+      .then(() => setSaveError(false))
+      .catch((e) => {
+        console.error(e);
+        setSaveError(true);
+      });
+  }, []);
 
   const persist = useCallback(
     (key, value) => {
       try {
         if (value === null) localStorage.removeItem(key);
         else localStorage.setItem(key, JSON.stringify(value));
-        setSaveError(false);
       } catch (e) {
         setSaveError(true);
+        return;
       }
 
       if (key === EX_KEY || key === EX_META_KEY || key === EX_GUIDE_KEY) {
         // Anagrafica condivisa: unica per tutti. Chiunque sia autenticato può
         // aggiungere esercizi (anche creando una scheda), così l'elenco resta
         // lo stesso per admin, personal trainer e utenti normali.
-        if (!authUser) return;
+        if (!authUser) { setSaveError(false); return; }
         const field =
           key === EX_KEY ? "exercises" :
           key === EX_META_KEY ? "exerciseMeta" : "exerciseGuide";
-        setDoc(doc(db, "shared", "registry"), { [field]: value }, { merge: true }).catch((e) =>
-          console.error(e)
-        );
+        syncCloud(doc(db, "shared", "registry"), field, value);
         return;
       }
 
-      if (authUser) {
-        const field =
-          key === LOG_KEY ? "logs" :
-          key === SCHEDE_KEY ? "schede" :
-          key === DRAFT_KEY ? "draftSession" :
-          key === ACTIVE_KEY ? "activeSchedaId" : null;
-        if (field) {
-          setDoc(doc(db, "users", authUser.uid), { [field]: value }, { merge: true }).catch((e) =>
-            console.error(e)
-          );
-        }
+      if (!authUser) { setSaveError(false); return; }
+      const field =
+        key === LOG_KEY ? "logs" :
+        key === SCHEDE_KEY ? "schede" :
+        key === DRAFT_KEY ? "draftSession" :
+        key === ACTIVE_KEY ? "activeSchedaId" : null;
+      if (field) syncCloud(doc(db, "users", authUser.uid), field, value);
+      else setSaveError(false);
+    },
+    [authUser, syncCloud]
+  );
+
+  // Migrazione: prima le schede vivevano dentro users/{uid}.schede (una copia
+  // indipendente per ciascun utente — è così che nasceva il bug "l'admin non
+  // vede le modifiche fatte dall'utente"). Ora la scheda è un documento UNICO
+  // nella collection condivisa "schede": chi l'ha creata e chi se l'è vista
+  // assegnare leggono/scrivono lo stesso documento. Qui si spostano i dati
+  // vecchi trovati in users/{uid}.schede.
+  // ⚠️ Il campo `schede` sul documento utente si svuota SOLO dopo che TUTTE
+  // le scritture nel posto nuovo sono confermate: è quel campo, non un flag a
+  // parte, a dire se la migrazione è già andata a buon fine. Un flag separato
+  // scritto senza aspettare l'esito delle altre scritture aveva già causato
+  // una perdita di visibilità: bastava un attimo di regole non ancora
+  // pubblicate durante la primissima esecuzione, il flag restava "vero" per
+  // sempre e la scheda spariva senza che si ritentasse mai più.
+  const migratingRef = useRef(false);
+  const migrateLegacySchede = useCallback(
+    async (list) => {
+      if (!authUser || !Array.isArray(list) || !list.length || migratingRef.current) return;
+      migratingRef.current = true;
+      const byName = authUser.displayName || authUser.email || "Tu";
+      try {
+        await Promise.all(
+          list.filter((s) => s && s.id).map((s) => {
+            if (s.sourceSchedaId) {
+              // Copia ottenuta accettando un'assegnazione: l'originale resta
+              // l'unico documento (lo crea/completa chi l'ha fatta), qui mi
+              // limito ad aggiungermi tra chi ce l'ha assegnata.
+              return setDoc(
+                doc(db, "schede", s.sourceSchedaId),
+                { assignedTo: arrayUnion({ uid: authUser.uid, name: byName }), assignedToUids: arrayUnion(authUser.uid) },
+                { merge: true }
+              );
+            }
+            return setDoc(
+              doc(db, "schede", s.id),
+              {
+                id: s.id,
+                name: s.name || "Scheda",
+                days: getDays(s),
+                ownerUid: authUser.uid,
+                ownerName: byName,
+                assignedTo: s.assignedTo || [],
+                assignedToUids: (s.assignedTo || []).map((t) => t.uid),
+                history: s.history || [],
+                createdAt: Date.now(),
+                updatedAt: Date.now(),
+              },
+              { merge: true }
+            );
+          })
+        );
+        // Solo ora, con tutte le scritture confermate, svuoto il campo
+        // vecchio: è questo a spegnere la migrazione, non un flag a parte.
+        await setDoc(doc(db, "users", authUser.uid), { schede: [] }, { merge: true });
+      } catch (e) {
+        console.error(e);
+        setSaveError(true);
+        // Non tocco il campo `schede`: al prossimo giro (nuovo login, nuovo
+        // snapshot, rete tornata) si ritenta da capo.
+      } finally {
+        migratingRef.current = false;
       }
     },
     [authUser]
   );
 
-  // Applica in automatico l'aggiornamento di una scheda già assegnata: trova
-  // la mia copia collegata (sourceSchedaId) e ne sostituisce nome e giorni,
-  // mantenendo però i miei id locali (sourceDayId fa da ponte) così la
-  // cronologia degli allenamenti resta agganciata.
-  const applySchedaUpdate = useCallback(
-    (a) => {
-      setSchede((prev) => {
-        let idx = prev.findIndex((s) => s.sourceSchedaId === a.sourceSchedaId);
-        // Assegnazioni accettate prima che esistesse questo collegamento non
-        // hanno sourceSchedaId salvato: ripiego sul nome (solo tra le schede
-        // che non sono già agganciate a un'altra origine). Una volta trovata,
-        // da qui in poi resta agganciata tramite sourceSchedaId.
-        if (idx === -1) {
-          idx = prev.findIndex((s) => !s.sourceSchedaId && s.name === a.scheda?.name);
-        }
-        if (idx === -1) return prev; // nessuna corrispondenza: aggiornamento ignorato
-        const local = prev[idx];
-        const incomingDays = Array.isArray(a.scheda?.days) ? a.scheda.days : [];
-        const localByOrigin = new Map(
-          (local.days || []).filter((d) => d.sourceDayId).map((d) => [d.sourceDayId, d])
-        );
-        // Stesso ripiego sul nome per i giorni non ancora agganciati
-        const localByName = new Map(
-          (local.days || []).filter((d) => !d.sourceDayId).map((d) => [d.name, d])
-        );
-        const days = incomingDays.map((d) => {
-          const existing = localByOrigin.get(d.id) || localByName.get(d.name);
-          return { id: existing ? existing.id : uid(), name: d.name, items: d.items, sourceDayId: d.id };
-        });
-        const next = prev.slice();
-        next[idx] = { ...local, name: a.scheda?.name || local.name, sourceSchedaId: a.sourceSchedaId, days };
-        persist(SCHEDE_KEY, next);
-        return next;
-      });
-      deleteDoc(doc(db, "assignments", a.id)).catch((e) => console.error(e));
-    },
-    [persist]
-  );
-
-  // Schede assegnate a me da admin o personal trainer: quelle nuove restano
-  // in sospeso finché non le accetto, quelle di tipo "update" (un PT/admin ha
-  // aggiornato una scheda già assegnata) si applicano da sole.
+  // Schede: due ascolti in parallelo (quelle che possiedo, quelle che mi sono
+  // state assegnate) uniti in un solo elenco. Niente più coda di
+  // "assegnazioni in sospeso" da accettare: essendo lo stesso documento,
+  // compare subito a chi viene assegnato.
+  const [ownedSchede, setOwnedSchede] = useState([]);
+  const [receivedSchede, setReceivedSchede] = useState([]);
+  // ⚠️ Non basta "authUser esiste" per fidarsi del risultato: se le regole
+  // Firestore sulla collection "schede" non sono ancora state pubblicate (o
+  // la rete è assente), gli ascolti qui sotto vanno in errore e non
+  // chiamerebbero mai la callback di successo — senza questi due flag,
+  // l'unione qui sotto scriverebbe comunque "vuoto" su schede E sulla cache
+  // locale, facendo SPARIRE dalla vista una scheda che invece è ancora lì,
+  // semplicemente non ancora letta. Si aggiorna solo quando ENTRAMBI gli
+  // ascolti hanno davvero risposto almeno una volta (anche con zero schede).
+  const [ownedLoaded, setOwnedLoaded] = useState(false);
+  const [receivedLoaded, setReceivedLoaded] = useState(false);
   useEffect(() => {
-    if (!authUser) {
-      setAssignments([]);
-      return;
-    }
-    const q = query(collection(db, "assignments"), where("toUid", "==", authUser.uid));
-    const unsub = onSnapshot(
-      q,
+    // Senza login non si tocca lo stato: resta quello letto da localStorage
+    // all'avvio (offline/senza account, come logs e draftSession). Il logout
+    // vero e proprio azzera già tutto nella guardia di cambio account qui sopra.
+    if (!authUser) return;
+    setOwnedLoaded(false);
+    setReceivedLoaded(false);
+    const unsubOwned = onSnapshot(
+      query(collection(db, "schede"), where("ownerUid", "==", authUser.uid)),
       (snap) => {
-        const all = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-        const updates = all.filter((a) => a.kind === "update");
-        setAssignments(all.filter((a) => a.kind !== "update"));
-        updates.forEach(applySchedaUpdate);
+        setOwnedSchede(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+        setOwnedLoaded(true);
       },
-      (e) => console.error(e)
+      (e) => {
+        console.error(e);
+        setSaveError(true);
+      }
     );
-    return unsub;
-  }, [authUser, applySchedaUpdate]);
+    const unsubReceived = onSnapshot(
+      query(collection(db, "schede"), where("assignedToUids", "array-contains", authUser.uid)),
+      (snap) => {
+        setReceivedSchede(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+        setReceivedLoaded(true);
+      },
+      (e) => {
+        console.error(e);
+        setSaveError(true);
+      }
+    );
+    return () => {
+      unsubOwned();
+      unsubReceived();
+    };
+  }, [authUser]);
+
+  useEffect(() => {
+    // Senza login non tocco lo stato: resta quello letto da localStorage
+    // all'avvio (offline/senza account). Il logout azzera già tutto nella
+    // guardia di cambio account qui sopra. E finché non ho la conferma di
+    // ENTRAMBI gli ascolti, non tocco né lo stato né la cache: uno dei due
+    // potrebbe essere ancora in caricamento o in errore (permessi non ancora
+    // propagati, rete assente...) e "vuoto" qui non vorrebbe dire "non hai
+    // schede", vorrebbe dire "non sono ancora riuscito a controllare".
+    if (!authUser || !ownedLoaded || !receivedLoaded) return;
+    const merged = [...ownedSchede, ...receivedSchede];
+    setSchede(merged);
+    try {
+      localStorage.setItem(SCHEDE_KEY, JSON.stringify(merged));
+    } catch (e) {
+      /* ignora */
+    }
+  }, [authUser, ownedSchede, receivedSchede, ownedLoaded, receivedLoaded]);
 
   const addLog = useCallback(
     (entry) => {
@@ -494,10 +684,15 @@ export default function App() {
     [persist]
   );
 
+  // ⚠️ La cancellazione di un allenamento NON è mai fisica: si marca solo con
+  // deletedAt (data/ora di cancellazione). Le voci con deletedAt restano nel
+  // documento ma sono nascoste ovunque tramite activeLogs/statsLogs; solo un
+  // admin può vederle e ripristinarle (o eliminarle per sempre) dalla sezione
+  // Admin → Cancellati. Vedi [[ghisa-log-soft-delete]] in memoria.
   const deleteLog = useCallback(
     (id) => {
       setLogs((prev) => {
-        const next = prev.filter((l) => l.id !== id);
+        const next = prev.map((l) => (l.id === id ? { ...l, deletedAt: Date.now() } : l));
         persist(LOG_KEY, next);
         return next;
       });
@@ -509,7 +704,7 @@ export default function App() {
     (ids) => {
       const idSet = new Set(ids);
       setLogs((prev) => {
-        const next = prev.filter((l) => !idSet.has(l.id));
+        const next = prev.map((l) => (idSet.has(l.id) ? { ...l, deletedAt: Date.now() } : l));
         persist(LOG_KEY, next);
         return next;
       });
@@ -629,10 +824,30 @@ export default function App() {
     [persist]
   );
 
+  // Applica una trasformazione esercizio-per-esercizio a tutte le schede che
+  // vedo (mie o assegnate a me) e scrive solo quelle davvero cambiate, una
+  // per una, direttamente sul documento condiviso — non più un unico array
+  // da riscrivere tutto insieme.
+  const updateSchedeExercises = useCallback(
+    (mapPart, byName) => {
+      schede.forEach((s) => {
+        const mapped = mapSchedaExercises(s, mapPart);
+        const days = getDays(mapped);
+        if (JSON.stringify(days) === JSON.stringify(getDays(s))) return;
+        const withHistory = withSchedaHistory({ ...s, days }, s, byName);
+        updateDoc(doc(db, "schede", s.id), { days, history: withHistory.history, updatedAt: Date.now() }).catch((e) =>
+          console.error(e)
+        );
+      });
+    },
+    [schede]
+  );
+
   const mergeExercises = useCallback(
     (namesToMerge, keepName) => {
       const toReplace = namesToMerge.filter((n) => n !== keepName);
       if (toReplace.length === 0) return;
+      const byName = authUser?.displayName || authUser?.email || "Tu";
 
       setLogs((prev) => {
         const next = prev.map((l) =>
@@ -642,16 +857,10 @@ export default function App() {
         return next;
       });
 
-      setSchede((prev) => {
-        const next = prev.map((s) => ({
-          ...s,
-          items: s.items.map((it) =>
-            toReplace.includes(it.exercise) ? { ...it, exercise: keepName } : it
-          ),
-        }));
-        persist(SCHEDE_KEY, next);
-        return next;
-      });
+      updateSchedeExercises(
+        (p) => (toReplace.includes(p.exercise) ? { ...p, exercise: keepName } : p),
+        byName
+      );
 
       setExercises((prev) => {
         const next = prev.filter((e) => !toReplace.includes(e));
@@ -683,7 +892,7 @@ export default function App() {
         return next;
       });
     },
-    [persist]
+    [persist, updateSchedeExercises, authUser]
   );
 
   const renameExercise = useCallback(
@@ -699,6 +908,7 @@ export default function App() {
         mergeExercises([oldName, collision], collision);
         return;
       }
+      const byName = authUser?.displayName || authUser?.email || "Tu";
 
       setLogs((prev) => {
         const next = prev.map((l) => (l.exercise === oldName ? { ...l, exercise: newName } : l));
@@ -706,14 +916,7 @@ export default function App() {
         return next;
       });
 
-      setSchede((prev) => {
-        const next = prev.map((s) => ({
-          ...s,
-          items: s.items.map((it) => (it.exercise === oldName ? { ...it, exercise: newName } : it)),
-        }));
-        persist(SCHEDE_KEY, next);
-        return next;
-      });
+      updateSchedeExercises((p) => (p.exercise === oldName ? { ...p, exercise: newName } : p), byName);
 
       setExercises((prev) => {
         const next = prev.map((e) => (e === oldName ? newName : e));
@@ -739,76 +942,82 @@ export default function App() {
         return next;
       });
     },
-    [exercises, persist, mergeExercises]
+    [exercises, persist, mergeExercises, updateSchedeExercises, authUser]
   );
 
+  // ⚠️ La scheda è UNICA: un solo documento condiviso, non una copia per
+  // utente. Chi la crea e chi se la vede assegnare scrivono sullo stesso
+  // documento — le modifiche dell'uno sono subito visibili all'altro (prima
+  // ognuno aveva la propria copia indipendente ed era facile disallinearle).
+  // La cronologia (withSchedaHistory) resta quindi condivisa: registra chi ha
+  // cambiato cosa e quando, chiunque sia stato.
   const saveScheda = useCallback(
     (scheda) => {
-      setSchede((prev) => {
-        const idx = prev.findIndex((s) => s.id === scheda.id);
-        let next;
-        if (idx === -1) next = [...prev, scheda];
-        else {
-          next = prev.slice();
-          next[idx] = scheda;
-        }
-        persist(SCHEDE_KEY, next);
-        return next;
-      });
-    },
-    [persist]
-  );
-
-  // Accetta una scheda assegnata: entra tra le mie e diventa modificabile da me.
-  // sourceSchedaId/sourceDayId restano come "ponte" verso l'originale di chi
-  // me l'ha mandata, per riconoscere gli aggiornamenti futuri.
-  const acceptAssignment = useCallback(
-    (a) => {
-      const src = a.scheda || {};
-      const nuova = {
-        id: uid(),
-        name: src.name || "Scheda assegnata",
-        sourceSchedaId: a.sourceSchedaId || null,
-        days: (Array.isArray(src.days) && src.days.length
-          ? src.days
-          : [{ id: uid(), name: src.name || "Giorno 1", items: src.items || [] }]
-        ).map((d) => ({ ...d, sourceDayId: d.id, id: uid() })),
-      };
-      setSchede((prev) => {
-        const next = [...prev, nuova];
-        persist(SCHEDE_KEY, next);
-        return next;
-      });
-      deleteDoc(doc(db, "assignments", a.id)).catch((e) => console.error(e));
-    },
-    [persist]
-  );
-
-  const rejectAssignment = useCallback((a) => {
-    confirmThen(`Rifiutare la scheda "${a.scheda?.name}"?`, () => {
-      deleteDoc(doc(db, "assignments", a.id)).catch((e) => console.error(e));
-    });
-  }, []);
-
-  // Rimanda una scheda già assegnata a chi la sta già usando: sovrascrive la
-  // loro copia con la versione attuale invece di crearne una nuova.
-  const pushSchedaUpdate = useCallback(
-    (scheda) => {
-      const targets = scheda.assignedTo || [];
-      if (!targets.length || !authUser) return;
-      const daysCopy = JSON.parse(JSON.stringify(getDays(scheda)));
-      targets.forEach((t) => {
-        const id = uid();
-        setDoc(doc(db, "assignments", id), {
-          id,
-          toUid: t.uid,
-          fromName: authUser.displayName || authUser.email,
-          kind: "update",
-          sourceSchedaId: scheda.id,
-          scheda: { name: scheda.name, days: daysCopy },
+      const byName = authUser?.displayName || authUser?.email || "Tu";
+      const existing = schede.find((s) => s.id === scheda.id);
+      if (!existing) {
+        // Nuova scheda: la creo io, di conseguenza ne sono il proprietario.
+        // (assignedTo può arrivare già valorizzato solo da "Duplica e
+        // assegna a...": lì si crea e si condivide in un solo passaggio.)
+        const assignedTo = scheda.assignedTo || [];
+        setDoc(doc(db, "schede", scheda.id), {
+          id: scheda.id,
+          name: scheda.name,
+          days: scheda.days,
+          ownerUid: authUser?.uid,
+          ownerName: byName,
+          assignedTo,
+          assignedToUids: assignedTo.map((t) => t.uid),
+          history: [{ at: Date.now(), byName, summary: "Scheda creata" }],
           createdAt: Date.now(),
+          updatedAt: Date.now(),
         }).catch((e) => console.error(e));
-      });
+        return;
+      }
+      // Modifica di una scheda esistente: aggiorno solo nome/giorni/cronologia,
+      // MAI ownerUid/assignedTo (così chi assegna e chi riceve restano quelli
+      // che erano, indipendentemente da chi ha appena salvato).
+      const withHistory = withSchedaHistory(scheda, existing, byName);
+      updateDoc(doc(db, "schede", scheda.id), {
+        name: scheda.name,
+        days: scheda.days,
+        history: withHistory.history,
+        updatedAt: Date.now(),
+      }).catch((e) => console.error(e));
+    },
+    [schede, authUser]
+  );
+
+  // Assegna una scheda a un'altra persona: da quel momento legge/scrive lo
+  // stesso documento, non una copia. Idempotente (arrayUnion) e senza alcuna
+  // "richiesta da accettare": compare subito tra le sue schede.
+  const assignScheda = useCallback(
+    (scheda, target) => {
+      const byName = authUser?.displayName || authUser?.email || "Tu";
+      const entry = { at: Date.now(), byName, summary: `Assegnata a ${target.name}` };
+      updateDoc(doc(db, "schede", scheda.id), {
+        assignedTo: arrayUnion({ uid: target.uid, name: target.name }),
+        assignedToUids: arrayUnion(target.uid),
+        history: [entry, ...(scheda.history || [])].slice(0, 30),
+        updatedAt: Date.now(),
+      }).catch((e) => console.error(e));
+    },
+    [authUser]
+  );
+
+  // L'owner toglie l'accesso a una persona (o se stessa, se è lei a "lasciare"
+  // una scheda ricevuta): non cancella il documento, solo la lega/slega.
+  const unassignScheda = useCallback(
+    (scheda, target) => {
+      const byName = authUser?.displayName || authUser?.email || "Tu";
+      const isSelf = authUser && target.uid === authUser.uid;
+      const summary = isSelf ? `${byName} ha lasciato la scheda` : `Rimossa a ${target.name}`;
+      updateDoc(doc(db, "schede", scheda.id), {
+        assignedTo: arrayRemove({ uid: target.uid, name: target.name }),
+        assignedToUids: arrayRemove(target.uid),
+        history: [{ at: Date.now(), byName, summary }, ...(scheda.history || [])].slice(0, 30),
+        updatedAt: Date.now(),
+      }).catch((e) => console.error(e));
     },
     [authUser]
   );
@@ -821,13 +1030,11 @@ export default function App() {
     [persist]
   );
 
+  // Elimina il documento per tutti (owner/admin soltanto, vedi firestore.rules
+  // — chi l'ha solo ricevuta non può farla sparire agli altri: usa "lascia").
   const deleteScheda = useCallback(
     (id) => {
-      setSchede((prev) => {
-        const next = prev.filter((s) => s.id !== id);
-        persist(SCHEDE_KEY, next);
-        return next;
-      });
+      deleteDoc(doc(db, "schede", id)).catch((e) => console.error(e));
       if (activeSchedaId === id) {
         setActiveSchedaId(null);
         persist(ACTIVE_KEY, null);
@@ -1212,6 +1419,8 @@ export default function App() {
         .g-history-sets { font-size: 12px; color: var(--ink-dim); font-family: 'JetBrains Mono', monospace; }
         .g-del-btn { background: none; border: none; color: var(--ink-dim); cursor: pointer; padding: 6px; }
         .g-del-btn:hover { color: var(--accent); }
+        .g-del-btn:disabled { opacity: 0.3; cursor: default; }
+        .g-del-btn:disabled:hover { color: var(--ink-dim); }
 
         .g-error-banner {
           background: rgba(193,80,46,0.15); border: 1px solid var(--accent);
@@ -1232,6 +1441,13 @@ export default function App() {
         .g-autocomplete-item:last-child { border-bottom: none; }
         .g-autocomplete-item:hover { background: var(--accent-dim); }
         .g-autocomplete-new { color: var(--accent); font-weight: 600; }
+        .g-searchable-trigger {
+          display: flex; align-items: center; justify-content: space-between; gap: 8px;
+          text-align: left;
+        }
+        .g-searchable-trigger > span {
+          overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        }
 
         .g-locked-field {
           width: 100%; background: var(--surface); border: 1px solid var(--line);
@@ -1260,6 +1476,17 @@ export default function App() {
         }
         .g-tag-warm { background: rgba(214,158,46,0.16); color: #d69e2e; border-color: rgba(214,158,46,0.4); }
         .g-tag-link { background: rgba(124,139,153,0.18); color: var(--steel); border-color: var(--steel); }
+        /* Pillole "Guida"/"Parte del corpo": stesso trattamento (sfondo
+           tinta steel, padding generoso, forma a pillola) delle sezioni di
+           pausa jump/superset, non delle piccole etichette di stato. */
+        .g-guide-pill {
+          display: inline-flex; align-items: center; gap: 5px;
+          font-size: 12px; font-weight: 600; text-transform: none; letter-spacing: 0.01em;
+          padding: 9px 14px; border-radius: 999px;
+          background: rgba(124,139,153,0.16); color: var(--steel); border: 1px solid var(--steel);
+          cursor: pointer; white-space: nowrap;
+        }
+        .g-guide-pill:hover { background: rgba(124,139,153,0.26); }
         .g-ex-note {
           margin: 10px 0 12px; padding: 8px 10px; border-radius: 8px;
           background: var(--surface-2); border-left: 3px solid var(--accent);
@@ -1325,9 +1552,11 @@ export default function App() {
         .g-note-dot { color: var(--accent); font-size: 8px; margin-left: 6px; vertical-align: middle; }
         .g-edit-row { background: var(--surface-2); border-radius: 10px; padding: 12px; margin-bottom: 8px; }
 
-        .g-admin-subtabs { display: flex; gap: 8px; margin-bottom: 16px; }
+        /* flex-wrap: con 5 sotto-sezioni admin (Esercizi/Utenti/Dati/Cancellati/
+           Pulizia) su un telefono stretto vanno su due righe invece di schiacciarsi */
+        .g-admin-subtabs { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
         .g-admin-subtab {
-          flex: 1; text-align: center; padding: 9px; border-radius: 10px;
+          flex: 1 1 88px; text-align: center; padding: 9px 4px; border-radius: 10px;
           border: 1px solid var(--line); background: var(--surface-2);
           color: var(--ink-dim); font-size: 12.5px; font-weight: 600;
           text-transform: uppercase; letter-spacing: 0.04em; cursor: pointer;
@@ -1445,7 +1674,7 @@ export default function App() {
         .g-mini-timer {
           display: flex; align-items: center; justify-content: center; gap: 10px;
           margin: 16px 0; padding: 10px 14px; border-radius: 999px;
-          background: var(--surface-2); border: 1px solid var(--steel);
+          background: rgba(124,139,153,0.16); border: 1px solid var(--steel);
         }
         .g-mini-timer-label {
           font-size: 10px; text-transform: uppercase; letter-spacing: 0.07em;
@@ -1467,8 +1696,8 @@ export default function App() {
         .g-part-block .g-counter-btn,
         .g-part-block .g-step-pill { background: var(--surface); }
         .g-part-block-head {
-          display: flex; align-items: center; justify-content: space-between;
-          gap: 10px; padding-bottom: 12px; border-bottom: 1px solid var(--line);
+          display: flex; flex-direction: column; align-items: flex-start;
+          gap: 6px; padding-bottom: 12px; border-bottom: 1px solid var(--line);
         }
         .g-part-block-name {
           font-family: 'Oswald', sans-serif; font-size: 15px; font-weight: 600;
@@ -1500,7 +1729,8 @@ export default function App() {
         .g-combo-arrow {
           text-align: center; font-size: 10.5px; color: var(--steel);
           text-transform: uppercase; letter-spacing: 0.06em; font-weight: 700;
-          padding: 16px 0 6px 0;
+          margin: 16px 0; padding: 9px 14px; border-radius: 999px;
+          background: rgba(124,139,153,0.16); border: 1px solid var(--steel);
         }
 
         .g-combo-divider {
@@ -1665,6 +1895,28 @@ export default function App() {
         }
         .g-set-col { flex: 1; text-align: center; }
         .g-set-spacer { width: 26px; flex-shrink: 0; }
+
+        /* Stepper -/+ incorporato dentro la stessa casella (non pulsanti a
+           fianco): un solo riquadro con i due tasti ai bordi interni. */
+        .g-inline-stepper {
+          flex: 1; min-width: 0; display: flex; align-items: stretch;
+          background: var(--surface-2); border: 1px solid var(--line); border-radius: 10px;
+          overflow: hidden;
+        }
+        .g-inline-stepper:focus-within { border-color: var(--accent); }
+        .g-inline-stepper-btn {
+          flex-shrink: 0; width: 28px; background: none; border: none;
+          color: var(--ink-dim); font-size: 16px; cursor: pointer;
+          display: flex; align-items: center; justify-content: center;
+        }
+        .g-inline-stepper-btn:hover { color: var(--accent); }
+        .g-inline-stepper-input {
+          flex: 1; min-width: 0; width: 100%; background: none; border: none; outline: none;
+          text-align: center; color: var(--ink); font-size: 15px; padding: 8px 0;
+          font-family: inherit; -moz-appearance: textfield;
+        }
+        .g-inline-stepper-input::-webkit-outer-spin-button,
+        .g-inline-stepper-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
         .g-set-row .g-del-btn { opacity: 0.5; }
         .g-set-row:hover .g-del-btn { opacity: 1; }
         .g-sets-wrap {
@@ -1724,6 +1976,26 @@ export default function App() {
         .g-modal {
           background: var(--surface); border: 1px solid var(--line); border-radius: 16px;
           padding: 22px; max-width: 380px; width: 100%; max-height: 80vh; overflow-y: auto;
+        }
+
+        /* Modale "Esercizio extra": serie × rip a sinistra, guida e parte
+           del corpo come pulsanti tondi a destra */
+        .g-extra-row { display: flex; align-items: flex-end; gap: 8px; margin-top: 12px; }
+        .g-extra-sep { height: 1px; background: var(--line); margin-top: 16px; }
+        .g-extra-amount { flex: 1; min-width: 0; display: flex; align-items: flex-end; gap: 6px; }
+        .g-extra-field { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+        .g-extra-field-label { font-size: 11px; color: var(--ink-dim); font-weight: 600; }
+        .g-extra-times { color: var(--ink-dim); font-weight: 700; padding-bottom: 9px; }
+        .g-round-btn {
+          flex-shrink: 0; width: 38px; height: 38px; border-radius: 50%;
+          display: flex; align-items: center; justify-content: center; cursor: pointer;
+          background: rgba(124,139,153,0.16); color: var(--steel); border: 1px solid var(--steel);
+        }
+        .g-round-btn:hover:not(:disabled), .g-round-btn.active { background: rgba(124,139,153,0.30); }
+        .g-round-btn:disabled { opacity: 0.4; cursor: default; }
+        .g-extra-body {
+          margin-top: 10px; padding: 10px; border-radius: 10px;
+          background: var(--surface-2); border: 1px solid var(--line);
         }
       `}</style>
 
@@ -1789,7 +2061,9 @@ export default function App() {
       <div className="g-body">
         {saveError && (
           <div className="g-error-banner">
-            Non riesco a salvare i dati in questo momento. Continua pure, riprovo automaticamente al prossimo salvataggio.
+            Non riesco a sincronizzare i dati con il cloud in questo momento (rete assente o instabile?).
+            Continua pure: restano salvati su questo dispositivo e riproverò a inviarli appena la connessione torna.
+            Non disinstallare l'app né cancellare i dati del browser finché questo avviso non sparisce.
           </div>
         )}
         {loading ? (
@@ -1804,6 +2078,8 @@ export default function App() {
             viewingUser={viewingUser}
             viewingLoading={viewingLoading}
             onViewUser={setViewingUid}
+            viewingOther={viewingOther}
+            onSetViewingOther={setViewingOther}
           />
         ) : view === "log" ? (
           <LogPage
@@ -1813,7 +2089,7 @@ export default function App() {
             canManageGuide={isStaff}
             onSetGuide={setExerciseGuideSlug}
             onClearGuide={clearExerciseGuideSlug}
-            logs={logs}
+            logs={activeLogs}
             schede={schede}
             onAddBatch={addLogsBatch}
             onDelete={deleteLog}
@@ -1822,6 +2098,16 @@ export default function App() {
             draft={draftSession}
             onSaveDraft={saveDraft}
             activeSchedaId={activeSchedaId}
+            isStaff={isStaff}
+            directoryUsers={staffDirectory}
+            viewingUid={viewingUid}
+            viewingUser={viewingUser}
+            viewingLoading={viewingLoading}
+            viewingLogs={viewingActiveLogs}
+            onViewUser={setViewingUid}
+            viewingOther={viewingOther}
+            onSetViewingOther={setViewingOther}
+            myUid={authUser?.uid}
           />
         ) : view === "schede" ? (
           <SchedeManager
@@ -1833,10 +2119,8 @@ export default function App() {
             onDeleteScheda={deleteScheda}
             canAssign={isStaff}
             authUser={authUser}
-            assignments={assignments}
-            onAcceptAssignment={acceptAssignment}
-            onRejectAssignment={rejectAssignment}
-            onPushUpdate={pushSchedaUpdate}
+            onAssignScheda={assignScheda}
+            onUnassignScheda={unassignScheda}
             activeSchedaId={activeSchedaId}
             onSetActive={setActiveScheda}
           />
@@ -1847,7 +2131,7 @@ export default function App() {
             exerciseGuide={exerciseGuide}
             onSetGuide={setExerciseGuideSlug}
             onClearGuide={clearExerciseGuideSlug}
-            logs={logs}
+            logs={activeLogs}
             totalLogCounts={totalLogCounts}
             totalsLoading={totalsLoading}
             onRefreshTotals={fetchTotalLogCounts}

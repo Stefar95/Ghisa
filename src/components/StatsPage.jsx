@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo, useRef } from "react";
 import {
-  LineChart,
+  ComposedChart,
+  Area,
   Line,
   XAxis,
   YAxis,
@@ -8,82 +9,11 @@ import {
   Tooltip,
   ResponsiveContainer,
 } from "recharts";
-import { TrendingUp, Flame, FileDown, Search, X, Users } from "lucide-react";
-import { formatDate, logSummary, SEARCH_MIN_CHARS } from "../lib/utils";
+import { TrendingUp, Flame, FileDown } from "lucide-react";
+import { formatDate, logSummary } from "../lib/utils";
 import { exportStatsPDF, logRowsForPDF } from "../lib/exporters";
-
-// Solo per admin/PT: cerca e scegli un utente per vedere le sue statistiche
-function UserStatsPicker({ users, viewingUid, viewingUser, viewingLoading, onViewUser }) {
-  const [q, setQ] = useState("");
-  const searching = q.trim().length >= SEARCH_MIN_CHARS;
-  const matches = useMemo(() => {
-    if (!searching) return [];
-    const s = q.trim().toLowerCase();
-    return users
-      .filter((u) => (u.displayName || "").toLowerCase().includes(s) || (u.email || "").toLowerCase().includes(s))
-      .slice(0, 20);
-  }, [users, q, searching]);
-
-  if (viewingUid) {
-    return (
-      <div className="g-card" style={{ marginBottom: 14, padding: "12px 14px" }}>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
-            <Users size={16} color="var(--accent)" style={{ flexShrink: 0 }} />
-            <div style={{ minWidth: 0 }}>
-              <div className="g-field-label" style={{ marginBottom: 1 }}>Statistiche di</div>
-              <div style={{ fontWeight: 600, fontSize: 14, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                {viewingLoading ? "Caricamento..." : viewingUser?.displayName || viewingUser?.email || "Utente"}
-              </div>
-            </div>
-          </div>
-          <button className="g-icon-btn" style={{ flexShrink: 0, fontSize: 12, gap: 5 }} onClick={() => onViewUser(null)}>
-            <X size={13} /> Torna alle tue
-          </button>
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <div className="g-card" style={{ marginBottom: 14 }}>
-      <div className="g-field-label">Statistiche di un altro utente</div>
-      <div className="g-search-field" style={{ marginTop: 4 }}>
-        <Search size={15} />
-        <input
-          className="g-input"
-          value={q}
-          onChange={(e) => setQ(e.target.value)}
-          placeholder="Cerca per nome o email..."
-        />
-      </div>
-      {users.length === 0 ? (
-        <div style={{ fontSize: 12.5, color: "var(--ink-dim)", marginTop: 8 }}>
-          Nessun altro utente ha ancora fatto accesso all'app.
-        </div>
-      ) : !searching ? (
-        <div style={{ fontSize: 11.5, color: "var(--ink-dim)", marginTop: 8 }}>
-          Scrivi almeno {SEARCH_MIN_CHARS} lettere (nome, cognome o email) per cercare.
-        </div>
-      ) : (
-        <div className="g-user-pick-list">
-          {matches.length === 0 ? (
-            <div style={{ fontSize: 12.5, color: "var(--ink-dim)", padding: "10px 12px" }}>
-              Nessun utente corrisponde alla ricerca.
-            </div>
-          ) : (
-            matches.map((u) => (
-              <div key={u.uid} className="g-user-pick-item" onClick={() => onViewUser(u.uid)}>
-                <div className="g-reg-name">{u.displayName || u.email}</div>
-                {u.displayName && <div className="g-reg-count">{u.email}</div>}
-              </div>
-            ))
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
+import StaffUserPicker from "./StaffUserPicker";
+import SearchableSelect from "./SearchableSelect";
 
 // Grafico singolo esercizio: linea top set + linea back-off se presente
 // Per gli esercizi a corpo libero il carico è sempre 0: ha senso seguire
@@ -131,7 +61,13 @@ function ExerciseChart({ logs, chartId, metric }) {
       )}
       <div style={{ width: "100%", height: 180, marginTop: 12 }} data-chart={chartId}>
         <ResponsiveContainer>
-          <LineChart data={data} margin={{ top: 8, right: 8, left: -18, bottom: 0 }}>
+          <ComposedChart data={data} margin={{ top: 8, right: 8, left: -18, bottom: 0 }}>
+            <defs>
+              <linearGradient id={`chartFill-${chartId}`} x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor="#c1502e" stopOpacity={0.32} />
+                <stop offset="100%" stopColor="#c1502e" stopOpacity={0} />
+              </linearGradient>
+            </defs>
             <CartesianGrid stroke="#8b8f96" strokeOpacity={0.3} strokeDasharray="3 3" vertical={false} />
             <XAxis dataKey="label" stroke="#9ba1ab" fontSize={11} tickLine={false} axisLine={{ stroke: "#8b8f96" }} />
             <YAxis stroke="#9ba1ab" fontSize={11} tickLine={false} axisLine={false} domain={["dataMin - 5", "dataMax + 5"]} />
@@ -140,13 +76,15 @@ function ExerciseChart({ logs, chartId, metric }) {
               labelStyle={{ color: "#9ba1ab" }}
               formatter={(v, name) => [`${v} ${metric.unit}`, name === "pesoBackoff" ? "Back-off" : "Top set"]}
             />
-            <Line type="monotone" dataKey="peso" stroke="#c1502e" strokeWidth={2.5}
+            <Area type="monotone" dataKey="peso" stroke="none" fill={`url(#chartFill-${chartId})`}
+              connectNulls activeDot={false} isAnimationActive={false} />
+            <Line type="monotone" dataKey="peso" stroke="#c1502e" strokeWidth={2.5} strokeLinecap="round"
               dot={{ r: 3, fill: "#c1502e", strokeWidth: 0 }} activeDot={{ r: 5 }} connectNulls />
             {hasBackoff && (
-              <Line type="monotone" dataKey="pesoBackoff" stroke="#7c8b99" strokeWidth={2} strokeDasharray="4 3"
+              <Line type="monotone" dataKey="pesoBackoff" stroke="#7c8b99" strokeWidth={2} strokeDasharray="4 3" strokeLinecap="round"
                 dot={{ r: 3, fill: "#7c8b99", strokeWidth: 0 }} activeDot={{ r: 5 }} connectNulls />
             )}
-          </LineChart>
+          </ComposedChart>
         </ResponsiveContainer>
       </div>
     </>
@@ -184,6 +122,7 @@ function StatBoxes({ logs, metric }) {
 export default function StatsPage({
   logs, goToLog,
   isStaff, directoryUsers = [], viewingUid, viewingUser, viewingLoading, onViewUser,
+  viewingOther = false, onSetViewingOther,
 }) {
   const [mode, setMode] = useState("esercizio"); // 'esercizio' | 'giorno'
   const [selectedEx, setSelectedEx] = useState("");
@@ -263,14 +202,25 @@ export default function StatsPage({
   };
 
   const picker = isStaff && (
-    <UserStatsPicker
+    <StaffUserPicker
       users={directoryUsers}
       viewingUid={viewingUid}
       viewingUser={viewingUser}
       viewingLoading={viewingLoading}
       onViewUser={onViewUser}
+      viewingOther={viewingOther}
+      onSetViewingOther={onSetViewingOther}
+      ownLabel="Le tue statistiche"
+      label="Statistiche di"
+      pickTitle="Statistiche di un altro utente"
     />
   );
+
+  // Su "Altro utente" ma nessuno ancora scelto: solo la ricerca, niente
+  // messaggi/grafici che si riferiscono ai propri dati (o a nessun dato).
+  if (viewingOther && !viewingUid) {
+    return <div>{picker}</div>;
+  }
 
   if (viewingUid && viewingLoading) {
     return (
@@ -329,15 +279,12 @@ export default function StatsPage({
 
       <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
         {mode === "esercizio" ? (
-          <select
-            className="g-input g-select"
+          <SearchableSelect
+            options={doneExercises}
             value={selectedEx}
-            onChange={(e) => setSelectedEx(e.target.value)}
-          >
-            {doneExercises.map((e) => (
-              <option key={e} value={e}>{e}</option>
-            ))}
-          </select>
+            onChange={setSelectedEx}
+            placeholder="Cerca esercizio..."
+          />
         ) : (
           <select
             className="g-input g-select"

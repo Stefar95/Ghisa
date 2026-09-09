@@ -1,10 +1,12 @@
 import { useState, useEffect } from "react";
-import { collection, onSnapshot, doc, setDoc } from "firebase/firestore";
+import { collection, onSnapshot } from "firebase/firestore";
 import { X, Send, User } from "lucide-react";
 import { db } from "../firebase";
-import { uid, getDays } from "../lib/utils";
 
-export default function AssignSchedaModal({ scheda, fromUser, onClose, onAssigned }) {
+// Assegnare non invia più una copia: aggiunge il destinatario a chi legge e
+// scrive lo STESSO documento scheda. Compare subito tra le sue, senza dover
+// accettare nulla, e da lì in poi le modifiche di entrambi si vedono a vicenda.
+export default function AssignSchedaModal({ scheda, fromUser, onClose, onAssign }) {
   const [users, setUsers] = useState(null);
   const [targetUid, setTargetUid] = useState("");
   const [busy, setBusy] = useState(false);
@@ -31,40 +33,15 @@ export default function AssignSchedaModal({ scheda, fromUser, onClose, onAssigne
     return unsub;
   }, [fromUser.uid]);
 
-  const send = async () => {
+  const send = () => {
     if (!targetUid) return;
+    const target = (users || []).find((u) => u.uid === targetUid);
+    if (!target) return;
     setBusy(true);
     setError(null);
-    try {
-      const id = uid();
-      await setDoc(doc(db, "assignments", id), {
-        id,
-        toUid: targetUid,
-        fromName: fromUser.displayName || fromUser.email,
-        // sourceSchedaId collega la copia all'originale: serve per riconoscere
-        // gli aggiornamenti futuri ("Aggiorna assegnazione")
-        sourceSchedaId: scheda.id,
-        scheda: {
-          // la copia è indipendente: chi la riceve può modificarla liberamente
-          name: scheda.name,
-          days: JSON.parse(JSON.stringify(getDays(scheda))),
-        },
-        createdAt: Date.now(),
-      });
-      const target = (users || []).find((u) => u.uid === targetUid);
-      if (onAssigned && target) {
-        onAssigned(scheda, {
-          uid: target.uid,
-          name: target.displayName || target.email || "Utente",
-        });
-      }
-      setDone(true);
-    } catch (e) {
-      console.error(e);
-      setError(e.message || String(e));
-    } finally {
-      setBusy(false);
-    }
+    onAssign(scheda, { uid: target.uid, name: target.displayName || target.email || "Utente" });
+    setBusy(false);
+    setDone(true);
   };
 
   return (
@@ -80,13 +57,13 @@ export default function AssignSchedaModal({ scheda, fromUser, onClose, onAssigne
         </div>
 
         <div style={{ fontSize: 13, color: "var(--ink-dim)", marginTop: 10 }}>
-          Invii una copia di <strong style={{ color: "var(--ink)" }}>{scheda.name}</strong>. Chi la
-          riceve potrà modificarla senza toccare la tua.
+          Condividi <strong style={{ color: "var(--ink)" }}>{scheda.name}</strong>: da quel momento è
+          la stessa scheda per entrambi, le modifiche di uno si vedono subito anche all'altro.
         </div>
 
         {done ? (
           <div className="g-card g-empty" style={{ padding: 20, marginTop: 16, color: "var(--success)" }}>
-            Scheda inviata. La troverà nella sua sezione Schede.
+            Fatto. La troverà subito nella sua sezione Schede.
           </div>
         ) : (
           <>

@@ -7,11 +7,14 @@ import {
   Pencil,
   ChevronLeft,
   ChevronRight,
+  ChevronUp,
+  ChevronDown,
   Play,
   Pause,
   RotateCcw,
   X,
   BookOpen,
+  Info,
 } from "lucide-react";
 import {
   uid, confirmThen, todayISO, formatDate, formatMMSS, STEPS,
@@ -24,6 +27,9 @@ import BodyDiagram from "./BodyDiagram";
 import ExercisePicker from "./ExercisePicker";
 import DurationField from "./DurationField";
 import ExerciseGuideModal from "./ExerciseGuideModal";
+import StaffUserPicker from "./StaffUserPicker";
+import SetFieldStepper from "./SetFieldStepper";
+import ExtraExerciseModal from "./ExtraExerciseModal";
 
 // Timer compatto per la pausa tra gli esercizi di un jumpset
 function MiniTimer({ seconds }) {
@@ -86,6 +92,9 @@ function MiniTimer({ seconds }) {
 export default function LogPage({
   exercises, exerciseMeta, exerciseGuide = {}, canManageGuide, onSetGuide, onClearGuide,
   logs, schede, onAddBatch, onDelete, onDeleteBatch, onUpdate, draft, onSaveDraft, activeSchedaId,
+  isStaff = false, directoryUsers = [], viewingUid = null, viewingUser = null,
+  viewingLoading = false, viewingLogs = null, onViewUser,
+  viewingOther = false, onSetViewingOther, myUid = null,
 }) {
   const [dayId, setDayId] = useState(() => (draft ? draft.dayId : null));
   // Prima si sceglie la scheda (di default quella attiva), poi il giorno
@@ -148,16 +157,21 @@ export default function LogPage({
     return () => clearTimeout(t);
   }, [alarmOn]);
   const [completed, setCompleted] = useState(false);
-  const [showBodyDiagram, setShowBodyDiagram] = useState(false);
+  // Indice (dentro il blocco) dell'esercizio di cui sto mostrando la forma
+  // del corpo, o null: uno alla volta, per non affollare la schermata quando
+  // il blocco ha più esercizi (superset/jumpset).
+  const [bodyDiagramFor, setBodyDiagramFor] = useState(null);
   // Nome dell'esercizio di cui sto guardando la guida (o null): la modale è
   // la stessa dell'anagrafica, letta qui in sola visualizzazione a meno di
   // essere admin/PT (allora si può collegare/correggere la guida al volo).
   const [guideFor, setGuideFor] = useState(null);
 
-  // In allenamento uso solo le schede mie: quelle passate ad altri non contano
+  // In allenamento uso le schede che sono ancora "mie da allenare": quelle che
+  // possiedo e non ho girato a nessuno, più quelle che qualcun altro mi ha
+  // assegnato (sempre lo stesso documento condiviso, non una copia).
   const mieSchede = useMemo(
-    () => schede.filter((s) => !(s.assignedTo || []).length),
-    [schede]
+    () => schede.filter((s) => s.ownerUid !== myUid || !(s.assignedTo || []).length),
+    [schede, myUid]
   );
   // Ogni scheda può contenere più giorni: qui li elenchiamo tutti insieme
   const allDays = useMemo(() => dayOptions(mieSchede), [mieSchede]);
@@ -246,7 +260,7 @@ export default function LogPage({
   }, [dayId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
-    setShowBodyDiagram(false);
+    setBodyDiagramFor(null);
   }, [dayId, stepIdx]);
 
   // Se la scheda viene modificata (meno esercizi) mentre è in corso una
@@ -521,6 +535,28 @@ export default function LogPage({
     }
   };
 
+  // Sposta un esercizio già aggiunto alla sessione in corso (non ancora
+  // salvata) su o giù di una posizione
+  const moveSessionItem = (tempId, dir) => {
+    setSession((prev) => {
+      const idx = prev.findIndex((e) => e.tempId === tempId);
+      const j = idx + dir;
+      if (idx < 0 || j < 0 || j >= prev.length) return prev;
+      const next = [...prev];
+      [next[idx], next[j]] = [next[j], next[idx]];
+      return next;
+    });
+  };
+
+  // Aggiunge un esercizio "extra" (non previsto dal percorso a step della
+  // scheda) direttamente alla sessione in corso, tramite una modale con le
+  // stesse opzioni del giorno libero (riscaldamento, serie diverse, ecc.)
+  const [addingExtra, setAddingExtra] = useState(false);
+  const confirmAddExtra = (entry) => {
+    setSession((prev) => [...prev, entry]);
+    setAddingExtra(false);
+  };
+
   const removeFromSession = (tempId) => {
     setSession((prev) => prev.filter((e) => e.tempId !== tempId));
   };
@@ -576,7 +612,7 @@ export default function LogPage({
     if (session.length === 0) return;
     confirmThen(`Salvare questo allenamento con ${session.length} esercizi?`, () => {
       const sessionId = uid();
-      const entries = session.map((e) => ({
+      const entries = session.map((e, order) => ({
         id: uid(),
         sessionId,
         exercise: e.exercise,
@@ -587,10 +623,12 @@ export default function LogPage({
         type: e.type || "reps",
         noWeight: !!e.noWeight,
         warmup: !!e.warmup,
+        ...(e.setDetails ? { setDetails: e.setDetails } : {}),
         dayId,
         dayName,
         date,
         note: sessionNote.trim(),
+        order,
       }));
       onAddBatch(entries);
       setSession([]);
@@ -601,14 +639,18 @@ export default function LogPage({
     });
   };
 
+  // Fuori dalla modalità "sto guardando un altro utente" è il mio storico;
+  // dentro, quello della persona scelta con StaffUserPicker (sola lettura).
+  const historyLogs = viewingUid ? viewingLogs || [] : logs;
   const sessionGroups = useMemo(() => {
     const map = new Map();
-    logs.forEach((l) => {
+    historyLogs.forEach((l) => {
       const key = l.sessionId || l.id;
       if (!map.has(key)) {
         map.set(key, {
           key,
           date: l.date,
+          dayId: l.dayId || null,
           dayName: l.dayName || "Giorno libero",
           note: l.note || "",
           entries: [],
@@ -616,11 +658,77 @@ export default function LogPage({
       }
       map.get(key).entries.push(l);
     });
+    // Le voci aggiunte "a posteriori" (dopo il salvataggio) non hanno un
+    // ordine esplicito finché non le sposti: restano nella posizione in cui
+    // sono arrivate (sort stabile).
+    map.forEach((g) => g.entries.sort((a, b) => (a.order ?? 0) - (b.order ?? 0)));
     return Array.from(map.values()).sort((a, b) => {
       if (a.date !== b.date) return a.date < b.date ? 1 : -1;
       return a.key < b.key ? 1 : -1;
     });
-  }, [logs]);
+  }, [historyLogs]);
+
+  // Risale al nome della scheda a cui apparteneva un allenamento salvato, per
+  // il filtro "Scheda" dello storico (solo per i propri, non per quelli di un
+  // altro utente: non abbiamo accesso alle sue schede).
+  const resolveSchedaName = (group) => {
+    if (!group.dayId || group.dayId === "libero") return "Giorno libero";
+    const opt = allDays.find((o) => o.id === group.dayId);
+    return opt ? opt.scheda.name : "Altro (scheda eliminata)";
+  };
+
+  const [histSchedaFilter, setHistSchedaFilter] = useState("");
+  const [histDayFilter, setHistDayFilter] = useState("");
+  const [histDateFrom, setHistDateFrom] = useState("");
+  const [histDateTo, setHistDateTo] = useState("");
+  const [histVisibleCount, setHistVisibleCount] = useState(10);
+  // Tutta la sezione "Storico allenamenti" parte chiusa: con mesi di
+  // allenamenti alle spalle occuperebbe da sola tutta la pagina.
+  const [histOpen, setHistOpen] = useState(false);
+
+  const histSchedaOptions = useMemo(() => {
+    if (viewingUid) return []; // niente schede disponibili per un altro utente
+    return Array.from(new Set(sessionGroups.map(resolveSchedaName))).sort((a, b) =>
+      a.localeCompare(b, "it", { sensitivity: "base" })
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionGroups, viewingUid]);
+  const histDayOptions = useMemo(
+    () => Array.from(new Set(sessionGroups.map((g) => g.dayName))).sort((a, b) => a.localeCompare(b, "it", { sensitivity: "base" })),
+    [sessionGroups]
+  );
+
+  const filteredSessionGroups = useMemo(() => {
+    return sessionGroups.filter((g) => {
+      if (histSchedaFilter && resolveSchedaName(g) !== histSchedaFilter) return false;
+      if (histDayFilter && g.dayName !== histDayFilter) return false;
+      if (histDateFrom && g.date < histDateFrom) return false;
+      if (histDateTo && g.date > histDateTo) return false;
+      return true;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionGroups, histSchedaFilter, histDayFilter, histDateFrom, histDateTo]);
+
+  const histFiltersActive = !!(histSchedaFilter || histDayFilter || histDateFrom || histDateTo);
+
+  // Cambiando un filtro si riparte dalla prima pagina di risultati
+  useEffect(() => {
+    setHistVisibleCount(10);
+  }, [histSchedaFilter, histDayFilter, histDateFrom, histDateTo]);
+
+  const visibleSessionGroups = filteredSessionGroups.slice(0, histVisibleCount);
+
+  // Sposta un esercizio dentro un allenamento già salvato: aggiorna l'ordine
+  // di tutti gli esercizi di quella sessione (anche quelli senza "order"
+  // ancora impostato, per partire da una base coerente).
+  const moveHistoryEntry = (group, index, dir) => {
+    const j = index + dir;
+    if (j < 0 || j >= group.entries.length) return;
+    group.entries.forEach((entry, i) => {
+      const newOrder = i === index ? j : i === j ? index : i;
+      if ((entry.order ?? i) !== newOrder) onUpdate(entry.id, { order: newOrder });
+    });
+  };
 
   const toggleExpanded = (key) => {
     setExpanded((prev) => {
@@ -664,44 +772,336 @@ export default function LogPage({
     });
   };
 
+  // Aggiunta di un esercizio a un allenamento già salvato: stessa modale
+  // dell'esercizio extra, poi conferma e scrittura diretta nello storico
   const [addingToKey, setAddingToKey] = useState(null);
-  const [addDraft, setAddDraft] = useState(null);
 
-  const startAddToSession = (group) => {
-    setAddingToKey(group.key);
-    setAddDraft({ exercise: "", weight: 20, sets: 3, reps: 10, backoff: false });
-  };
-
-  const cancelAddToSession = () => {
-    setAddingToKey(null);
-    setAddDraft(null);
-  };
-
-  const confirmAddToSession = (group) => {
-    if (!addDraft || !addDraft.exercise.trim()) return;
-    confirmThen(`Aggiungere "${addDraft.exercise.trim()}" a questo allenamento già salvato?`, () => {
+  const confirmAddToSession = (group, entry) => {
+    confirmThen(`Aggiungere "${entry.exercise}" a questo allenamento già salvato?`, () => {
       onAddBatch([
         {
           id: uid(),
           sessionId: group.key,
-          exercise: addDraft.exercise.trim(),
-          weight: addDraft.weight,
-          sets: addDraft.sets,
-          reps: addDraft.reps,
-          backoff: addDraft.backoff,
+          exercise: entry.exercise,
+          weight: entry.weight,
+          sets: entry.sets,
+          reps: entry.reps,
+          backoff: entry.backoff,
+          type: entry.type || "reps",
+          noWeight: !!entry.noWeight,
+          warmup: !!entry.warmup,
+          ...(entry.setDetails ? { setDetails: entry.setDetails } : {}),
           dayId: null,
           dayName: group.dayName,
           date: group.date,
           note: "",
+          order: group.entries.length,
         },
       ]);
       setAddingToKey(null);
-      setAddDraft(null);
     });
   };
 
+  // Storico allenamenti: condiviso tra "i miei" (con modifica/eliminazione)
+  // e la vista in sola lettura di un altro utente — cambia solo cosa si può
+  // toccare, filtri e compattazione (raccolta, mostra-altri) sono uguali.
+  const renderStorico = (readOnly) => (
+    <div>
+      <button
+        onClick={() => setHistOpen((o) => !o)}
+        style={{
+          display: "flex", alignItems: "center", justifyContent: "space-between", width: "100%",
+          background: "none", border: "none", cursor: "pointer", padding: "4px 0 10px 0",
+        }}
+      >
+        <span className="g-field-label" style={{ marginBottom: 0 }}>
+          Storico allenamenti{sessionGroups.length > 0 ? ` (${sessionGroups.length})` : ""}
+        </span>
+        {histOpen ? <ChevronUp size={16} color="var(--ink-dim)" /> : <ChevronDown size={16} color="var(--ink-dim)" />}
+      </button>
+
+      {histOpen && (
+      <>
+      {sessionGroups.length > 0 && (
+        <div className="g-card" style={{ marginBottom: 10, padding: "10px 14px" }}>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+            {histSchedaOptions.length > 0 && (
+              <select
+                className="g-input g-select"
+                style={{ flex: "1 1 140px" }}
+                value={histSchedaFilter}
+                onChange={(e) => setHistSchedaFilter(e.target.value)}
+              >
+                <option value="">Tutte le schede</option>
+                {histSchedaOptions.map((s) => (
+                  <option key={s} value={s}>{s}</option>
+                ))}
+              </select>
+            )}
+            <select
+              className="g-input g-select"
+              style={{ flex: "1 1 140px" }}
+              value={histDayFilter}
+              onChange={(e) => setHistDayFilter(e.target.value)}
+            >
+              <option value="">Tutti i giorni</option>
+              {histDayOptions.map((d) => (
+                <option key={d} value={d}>{d}</option>
+              ))}
+            </select>
+            <input
+              className="g-input"
+              type="date"
+              style={{ flex: "1 1 130px", padding: "8px 10px" }}
+              value={histDateFrom}
+              onChange={(e) => setHistDateFrom(e.target.value)}
+              title="Da questa data"
+            />
+            <input
+              className="g-input"
+              type="date"
+              style={{ flex: "1 1 130px", padding: "8px 10px" }}
+              value={histDateTo}
+              onChange={(e) => setHistDateTo(e.target.value)}
+              title="Fino a questa data"
+            />
+          </div>
+          {histFiltersActive && (
+            <button
+              className="g-parts-link"
+              style={{ fontSize: 12, marginTop: 8 }}
+              onClick={() => {
+                setHistSchedaFilter("");
+                setHistDayFilter("");
+                setHistDateFrom("");
+                setHistDateTo("");
+              }}
+            >
+              Azzera filtri
+            </button>
+          )}
+        </div>
+      )}
+
+      {sessionGroups.length === 0 ? (
+        <div className="g-card g-empty" style={{ padding: 24 }}>
+          {readOnly ? "Nessun allenamento registrato da questo utente." : "Nessun allenamento registrato ancora."}
+        </div>
+      ) : filteredSessionGroups.length === 0 ? (
+        <div className="g-card g-empty" style={{ padding: 24 }}>
+          Nessun allenamento corrisponde ai filtri scelti.
+        </div>
+      ) : (
+        <>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {visibleSessionGroups.map((g) => {
+              const isOpen = expanded.has(g.key);
+              return (
+                <div className="g-card" key={g.key} style={{ padding: "10px 14px" }}>
+                  <div
+                    style={{ display: "flex", alignItems: "center", justifyContent: "space-between", cursor: "pointer" }}
+                    onClick={() => toggleExpanded(g.key)}
+                  >
+                    <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                      <div className="g-history-date" style={{ width: 46 }}>{formatDate(g.date)}</div>
+                      <div>
+                        <div className="g-session-name">
+                          {g.dayName}
+                          {g.note && <span className="g-note-dot" title="Ha delle note">●</span>}
+                        </div>
+                        <div className="g-reg-count">{g.entries.length} esercizi</div>
+                      </div>
+                    </div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      {!readOnly && (
+                        <button
+                          className="g-del-btn"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            deleteSession(g);
+                          }}
+                          aria-label="Elimina allenamento"
+                        >
+                          <Trash2 size={16} />
+                        </button>
+                      )}
+                      {isOpen ? (
+                        <ChevronLeft size={16} style={{ transform: "rotate(-90deg)", color: "var(--ink-dim)" }} />
+                      ) : (
+                        <ChevronRight size={16} style={{ transform: "rotate(90deg)", color: "var(--ink-dim)" }} />
+                      )}
+                    </div>
+                  </div>
+
+                  {isOpen && (
+                    <div style={{ marginTop: 10, borderTop: "1px solid var(--line)", paddingTop: 8 }}>
+                      {!readOnly && (
+                        <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 10 }}>
+                          <label className="g-field-label" style={{ marginBottom: 0, flexShrink: 0 }}>
+                            Data allenamento
+                          </label>
+                          <input
+                            className="g-input"
+                            type="date"
+                            style={{ padding: "7px 10px", fontSize: 13 }}
+                            value={g.date}
+                            onChange={(e) => changeSessionDate(g, e.target.value)}
+                          />
+                        </div>
+                      )}
+                      {g.note && (
+                        <div style={{ fontSize: 12, color: "var(--ink-dim)", fontStyle: "italic", marginBottom: 8 }}>
+                          "{g.note}"
+                        </div>
+                      )}
+                      {g.entries.map((l, idx) =>
+                        !readOnly && editingId === l.id ? (
+                          <div className="g-edit-row" key={l.id}>
+                            <div className="g-history-ex" style={{ marginBottom: 8 }}>
+                              {l.exercise}
+                              {editDraft.backoff && <span style={{ color: "var(--steel)", fontSize: 11 }}> · back-off</span>}
+                            </div>
+                            <div style={{ display: "flex", gap: 8 }}>
+                              <div style={{ flex: 1 }}>
+                                <label className="g-field-label">Peso</label>
+                                <input
+                                  className="g-input g-num-small"
+                                  type="number"
+                                  step="0.5"
+                                  value={editDraft.weight}
+                                  onChange={(e) => setEditDraft((d) => ({ ...d, weight: parseFloat(e.target.value) || 0 }))}
+                                />
+                              </div>
+                              <div style={{ flex: 1 }}>
+                                <label className="g-field-label">Serie</label>
+                                <input
+                                  className="g-input g-num-small"
+                                  type="number"
+                                  min="1"
+                                  value={editDraft.sets}
+                                  onChange={(e) => setEditDraft((d) => ({ ...d, sets: parseInt(e.target.value) || 1 }))}
+                                />
+                              </div>
+                              <div style={{ flex: 1 }}>
+                                <label className="g-field-label">Reps</label>
+                                <input
+                                  className="g-input g-num-small"
+                                  type="number"
+                                  min="1"
+                                  value={editDraft.reps}
+                                  onChange={(e) => setEditDraft((d) => ({ ...d, reps: parseInt(e.target.value) || 1 }))}
+                                />
+                              </div>
+                            </div>
+                            <label className="g-checkbox-row">
+                              <input
+                                type="checkbox"
+                                checked={editDraft.backoff}
+                                onChange={(e) => setEditDraft((d) => ({ ...d, backoff: e.target.checked }))}
+                              />
+                              Serie back-off
+                            </label>
+                            <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                              <button className="g-icon-btn" style={{ flex: 1, justifyContent: "center" }} onClick={cancelEditEntry}>
+                                Annulla
+                              </button>
+                              <button className="g-submit" style={{ flex: 1, marginTop: 0 }} onClick={saveEditEntry}>
+                                Salva
+                              </button>
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="g-history-row" key={l.id}>
+                            <div className="g-history-main">
+                              <div className="g-history-ex">
+                                {l.exercise}
+                                {l.backoff && <span style={{ color: "var(--steel)", fontSize: 11 }}> · back-off</span>}
+                              </div>
+                              <div className="g-history-sets">{logSummary(l)}</div>
+                            </div>
+                            {!readOnly && (
+                              <div style={{ display: "flex", gap: 2 }}>
+                                <button className="g-del-btn" disabled={idx === 0} onClick={() => moveHistoryEntry(g, idx, -1)} aria-label="Sposta su">
+                                  <ChevronUp size={15} />
+                                </button>
+                                <button className="g-del-btn" disabled={idx === g.entries.length - 1} onClick={() => moveHistoryEntry(g, idx, 1)} aria-label="Sposta giù">
+                                  <ChevronDown size={15} />
+                                </button>
+                                <button className="g-del-btn" onClick={() => startEditEntry(l)} aria-label="Modifica">
+                                  <Pencil size={15} />
+                                </button>
+                                <button
+                                  className="g-del-btn"
+                                  onClick={() => confirmThen(`Eliminare "${l.exercise}" da questo allenamento?`, () => onDelete(l.id))}
+                                  aria-label="Elimina"
+                                >
+                                  <Trash2 size={16} />
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        )
+                      )}
+
+                      {!readOnly && (
+                        <button
+                          className="g-icon-btn"
+                          style={{ width: "100%", justifyContent: "center", marginTop: 4 }}
+                          onClick={() => setAddingToKey(g.key)}
+                        >
+                          <Plus size={14} /> Aggiungi esercizio a questo allenamento
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+          {filteredSessionGroups.length > histVisibleCount && (
+            <button
+              className="g-icon-btn"
+              style={{ width: "100%", justifyContent: "center", marginTop: 10 }}
+              onClick={() => setHistVisibleCount((c) => c + 10)}
+            >
+              Mostra altri allenamenti ({filteredSessionGroups.length - histVisibleCount} rimasti)
+            </button>
+          )}
+        </>
+      )}
+      </>
+      )}
+    </div>
+  );
+
   return (
     <div>
+      {isStaff && (
+        <StaffUserPicker
+          users={directoryUsers}
+          viewingUid={viewingUid}
+          viewingUser={viewingUser}
+          viewingLoading={viewingLoading}
+          onViewUser={onViewUser}
+          viewingOther={viewingOther}
+          onSetViewingOther={onSetViewingOther}
+          ownLabel="Il tuo allenamento"
+          label="Allenamenti di"
+          pickTitle="Allenamenti di un altro utente"
+        />
+      )}
+
+      {viewingOther && !viewingUid ? null : viewingUid ? (
+        // Admin/PT che guardano l'allenamento di qualcun altro: sola
+        // visualizzazione, nessun pulsante di modifica/eliminazione/aggiunta —
+        // niente qui deve poter scrivere nel documento di un altro utente.
+        viewingLoading ? (
+          <div className="g-card g-empty">Caricamento allenamenti...</div>
+        ) : (
+          renderStorico(true)
+        )
+      ) : (
+        <>
       <div style={{ marginBottom: 14 }}>
         <div className="g-field-label">Scheda</div>
         <select
@@ -806,7 +1206,6 @@ export default function LogPage({
                   {combo !== "none" && <span className="g-combo-label"> · {comboLabel(combo)}</span>}
                   {backoffPhase && <span style={{ color: "var(--steel)" }}> · back-off</span>}
                 </div>
-                <div className="g-ex-name">{blockParts.map((p) => p.exercise).join(" + ")}</div>
                 <div className="g-ex-tags">
                   {currentBlock?.warmup && <span className="g-tag g-tag-warm">Riscaldamento</span>}
                   {combo === "jumpset" && (
@@ -826,8 +1225,6 @@ export default function LogPage({
                 </button>
               </div>
             </div>
-
-            {currentBlock?.note && <div className="g-ex-note">{currentBlock.note}</div>}
 
             {activeParts.map((x, k) => {
               const part = x.part;
@@ -853,53 +1250,57 @@ export default function LogPage({
                     )
                   )}
                   <div className={multiplo ? "g-part-block" : ""}>
-                    {multiplo && (
-                      <div className="g-part-block-head">
-                        <span className="g-part-block-name">{part.exercise}</span>
-                        <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                          <button
-                            className="g-parts-link"
-                            onClick={() => setGuideFor(part.exercise)}
-                            title="Guida esercizio"
-                            aria-label="Guida esercizio"
-                          >
-                            <BookOpen size={13} color={exerciseGuide[part.exercise] ? "var(--success)" : undefined} />
-                          </button>
+                    <div className="g-part-block-head">
+                      <span className="g-part-block-name">{part.exercise}</span>
+                      {/* Serie × rip a sinistra, guida e parte del corpo a destra */}
+                      <div className="g-extra-row" style={{ marginTop: 0, alignItems: "center", alignSelf: "stretch" }}>
+                        <div style={{ flex: 1, minWidth: 0 }}>
                           <span className="g-tag g-tag-target">
                             {aCardio ? formatMMSS(q.max) : `${nSerie}x${repsLabel(q.min, q.max)}${aTempo ? "s" : ""}`}
                           </span>
-                        </span>
+                        </div>
+                        <button
+                          className="g-round-btn"
+                          onClick={() => setGuideFor(part.exercise)}
+                          aria-label="Guida all'esercizio"
+                          title="Guida all'esercizio"
+                        >
+                          <BookOpen size={16} color={exerciseGuide[part.exercise] ? "var(--success)" : undefined} />
+                        </button>
+                        <button
+                          className={`g-round-btn ${bodyDiagramFor === x.idx ? "active" : ""}`}
+                          onClick={() => setBodyDiagramFor((cur) => (cur === x.idx ? null : x.idx))}
+                          aria-label="Parte del corpo"
+                          title="Parte del corpo"
+                        >
+                          <Info size={16} />
+                        </button>
+                      </div>
+                    </div>
+
+                    {bodyDiagramFor === x.idx && (
+                      <div className="g-extra-body">
+                        {parti.length > 0 ? (
+                          <>
+                            <div className="g-extra-field-label" style={{ marginBottom: 6 }}>{parti.join(", ")}</div>
+                            <BodyDiagram selected={parti} size={64} />
+                          </>
+                        ) : (
+                          <div className="g-extra-field-label">Nessuna parte del corpo registrata per questo esercizio.</div>
+                        )}
                       </div>
                     )}
-                    {!multiplo && (
-                      <div className="g-ex-tags" style={{ marginTop: 0, marginBottom: 4 }}>
-                        <span className="g-tag g-tag-target">
-                          {aCardio ? formatMMSS(q.max) : `${nSerie}x${repsLabel(q.min, q.max)}${aTempo ? "s" : ""}`}
-                        </span>
-                        <button
-                          className="g-parts-link g-tag"
-                          onClick={() => setGuideFor(part.exercise)}
-                          title="Guida esercizio"
-                        >
-                          <BookOpen size={11} color={exerciseGuide[part.exercise] ? "var(--success)" : undefined} style={{ verticalAlign: "-1px", marginRight: 3 }} />
-                          Guida
-                        </button>
-                        {parti.length > 0 && (
-                          <button className="g-parts-link g-tag" onClick={() => setShowBodyDiagram((b) => !b)}>
-                            {parti.join(", ")}{showBodyDiagram ? " ▲" : " ▼"}
-                          </button>
-                        )}
+
+                    {k === 0 && currentBlock?.note && <div className="g-ex-note">{currentBlock.note}</div>}
+
+                    {(senzaCarico || aSfinimento || aCardio) && (
+                      <div className="g-ex-tags" style={{ marginTop: 6, marginBottom: 4 }}>
                         {senzaCarico && <span className="g-tag">Corpo libero</span>}
                         {aSfinimento && <span className="g-tag">A sfinimento</span>}
                         {aCardio && <span className="g-tag">Cardio</span>}
                       </div>
                     )}
 
-                    {!multiplo && showBodyDiagram && parti.length > 0 && (
-                      <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px solid var(--line)" }}>
-                        <BodyDiagram selected={parti} size={64} />
-                      </div>
-                    )}
 
                     {!aCardio && (
                       <div className="g-seg" style={{ marginTop: 12 }}>
@@ -1025,20 +1426,18 @@ export default function LogPage({
                           <div className="g-set-row" key={j}>
                             <span className="g-set-num">{j + 1}ª</span>
                             {!senzaCarico && (
-                              <input
-                                className="g-input g-set-input ghisa-mono"
-                                type="number"
-                                step="0.5"
+                              <SetFieldStepper
+                                mono
+                                step={0.25}
                                 value={r.weight}
-                                onChange={(e) => updateSetRow(x.idx, j, { weight: e.target.value })}
+                                onChange={(val) => updateSetRow(x.idx, j, { weight: val })}
                               />
                             )}
-                            <input
-                              className="g-input g-set-input ghisa-mono"
-                              type="number"
-                              min="0"
+                            <SetFieldStepper
+                              mono
+                              step={1}
                               value={r.reps}
-                              onChange={(e) => updateSetRow(x.idx, j, { reps: e.target.value })}
+                              onChange={(val) => updateSetRow(x.idx, j, { reps: val })}
                             />
                             {v.setRows.length > 1 && (
                               <button className="g-del-btn" onClick={() => removeSetRow(x.idx, j)}>
@@ -1061,17 +1460,43 @@ export default function LogPage({
           <>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
               <label className="g-field-label" style={{ marginBottom: 6 }}>Esercizio</label>
-              {exerciseInput.trim() && (
+              <div style={{ display: "flex", gap: 8, marginBottom: 6 }}>
                 <button
-                  className="g-parts-link"
-                  style={{ fontSize: 11, display: "flex", alignItems: "center", gap: 3, marginBottom: 6 }}
+                  className="g-round-btn"
+                  disabled={!exerciseInput.trim()}
                   onClick={() => setGuideFor(exerciseInput.trim())}
+                  aria-label="Guida all'esercizio"
+                  title="Guida all'esercizio"
                 >
-                  <BookOpen size={12} color={exerciseGuide[exerciseInput.trim()] ? "var(--success)" : undefined} /> Guida
+                  <BookOpen size={16} color={exerciseGuide[exerciseInput.trim()] ? "var(--success)" : undefined} />
                 </button>
-              )}
+                <button
+                  className={`g-round-btn ${bodyDiagramFor === "libero" ? "active" : ""}`}
+                  disabled={!exerciseInput.trim()}
+                  onClick={() => setBodyDiagramFor((cur) => (cur === "libero" ? null : "libero"))}
+                  aria-label="Parte del corpo"
+                  title="Parte del corpo"
+                >
+                  <Info size={16} />
+                </button>
+              </div>
             </div>
             <ExercisePicker exercises={exercises} value={exerciseInput} onChange={setExerciseInput} placeholder="" />
+
+            {bodyDiagramFor === "libero" && exerciseInput.trim() && (
+              <div className="g-extra-body">
+                {(exerciseMeta[exerciseInput.trim()] || []).length > 0 ? (
+                  <>
+                    <div className="g-extra-field-label" style={{ marginBottom: 6 }}>
+                      {exerciseMeta[exerciseInput.trim()].join(", ")}
+                    </div>
+                    <BodyDiagram selected={exerciseMeta[exerciseInput.trim()]} size={64} />
+                  </>
+                ) : (
+                  <div className="g-extra-field-label">Nessuna parte del corpo registrata per questo esercizio.</div>
+                )}
+              </div>
+            )}
 
             <div className="g-seg" style={{ marginTop: 12 }}>
               {EX_TYPES.map((t) => (
@@ -1180,20 +1605,18 @@ export default function LogPage({
                       <div className="g-set-row" key={j}>
                         <span className="g-set-num">{j + 1}ª</span>
                         {!freeNoWeight && (
-                          <input
-                            className="g-input g-set-input ghisa-mono"
-                            type="number"
-                            step="0.5"
+                          <SetFieldStepper
+                            mono
+                            step={0.25}
                             value={r.weight}
-                            onChange={(e) => updateFreeSetRow(j, { weight: e.target.value })}
+                            onChange={(val) => updateFreeSetRow(j, { weight: val })}
                           />
                         )}
-                        <input
-                          className="g-input g-set-input ghisa-mono"
-                          type="number"
-                          min="0"
+                        <SetFieldStepper
+                          mono
+                          step={1}
                           value={r.reps}
-                          onChange={(e) => updateFreeSetRow(j, { reps: e.target.value })}
+                          onChange={(val) => updateFreeSetRow(j, { reps: val })}
                         />
                         {freeSetRows.length > 1 && (
                           <button className="g-del-btn" onClick={() => removeFreeSetRow(j)}>
@@ -1275,7 +1698,7 @@ export default function LogPage({
           </div>
         ) : (
           <div className="g-card" style={{ padding: "4px 14px" }}>
-            {session.map((e) =>
+            {session.map((e, idx) =>
               editingSessionId === e.tempId ? (
                 <div className="g-edit-row" key={e.tempId}>
                   <label className="g-field-label">Esercizio</label>
@@ -1387,6 +1810,12 @@ export default function LogPage({
                     <div className="g-history-sets">{logSummary(e)}</div>
                   </div>
                   <div style={{ display: "flex", gap: 2 }}>
+                    <button className="g-del-btn" disabled={idx === 0} onClick={() => moveSessionItem(e.tempId, -1)} aria-label="Sposta su">
+                      <ChevronUp size={15} />
+                    </button>
+                    <button className="g-del-btn" disabled={idx === session.length - 1} onClick={() => moveSessionItem(e.tempId, 1)} aria-label="Sposta giù">
+                      <ChevronDown size={15} />
+                    </button>
                     <button className="g-del-btn" onClick={() => startEditSession(e)} aria-label="Modifica">
                       <Pencil size={15} />
                     </button>
@@ -1399,6 +1828,15 @@ export default function LogPage({
             )}
           </div>
         )}
+
+        <button
+          className="g-icon-btn"
+          style={{ width: "100%", justifyContent: "center", marginTop: 8 }}
+          onClick={() => setAddingExtra(true)}
+        >
+          <Plus size={14} /> Aggiungi esercizio extra
+        </button>
+
         <button className="g-submit" disabled={session.length === 0} onClick={saveSession} style={{ marginTop: 10 }}>
           Salva sessione ({session.length})
         </button>
@@ -1407,226 +1845,39 @@ export default function LogPage({
       )}
 
       <div style={{ marginTop: 18 }}>
-        <div className="g-field-label">Storico allenamenti</div>
-        {sessionGroups.length === 0 ? (
-          <div className="g-card g-empty" style={{ padding: 24 }}>
-            Nessun allenamento registrato ancora.
-          </div>
-        ) : (
-          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-            {sessionGroups.map((g) => {
-              const isOpen = expanded.has(g.key);
-              return (
-                <div className="g-card" key={g.key} style={{ padding: "10px 14px" }}>
-                  <div
-                    style={{ display: "flex", alignItems: "center", justifyContent: "space-between", cursor: "pointer" }}
-                    onClick={() => toggleExpanded(g.key)}
-                  >
-                    <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                      <div className="g-history-date" style={{ width: 46 }}>{formatDate(g.date)}</div>
-                      <div>
-                        <div className="g-session-name">
-                          {g.dayName}
-                          {g.note && <span className="g-note-dot" title="Ha delle note">●</span>}
-                        </div>
-                        <div className="g-reg-count">{g.entries.length} esercizi</div>
-                      </div>
-                    </div>
-                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                      <button
-                        className="g-del-btn"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          deleteSession(g);
-                        }}
-                        aria-label="Elimina allenamento"
-                      >
-                        <Trash2 size={16} />
-                      </button>
-                      {isOpen ? <ChevronLeft size={16} style={{ transform: "rotate(-90deg)", color: "var(--ink-dim)" }} /> : <ChevronRight size={16} style={{ transform: "rotate(90deg)", color: "var(--ink-dim)" }} />}
-                    </div>
-                  </div>
-
-                  {isOpen && (
-                    <div style={{ marginTop: 10, borderTop: "1px solid var(--line)", paddingTop: 8 }}>
-                      <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 10 }}>
-                        <label className="g-field-label" style={{ marginBottom: 0, flexShrink: 0 }}>
-                          Data allenamento
-                        </label>
-                        <input
-                          className="g-input"
-                          type="date"
-                          style={{ padding: "7px 10px", fontSize: 13 }}
-                          value={g.date}
-                          onChange={(e) => changeSessionDate(g, e.target.value)}
-                        />
-                      </div>
-                      {g.note && (
-                        <div style={{ fontSize: 12, color: "var(--ink-dim)", fontStyle: "italic", marginBottom: 8 }}>
-                          "{g.note}"
-                        </div>
-                      )}
-                      {g.entries.map((l) =>
-                        editingId === l.id ? (
-                          <div className="g-edit-row" key={l.id}>
-                            <div className="g-history-ex" style={{ marginBottom: 8 }}>
-                              {l.exercise}
-                              {editDraft.backoff && <span style={{ color: "var(--steel)", fontSize: 11 }}> · back-off</span>}
-                            </div>
-                            <div style={{ display: "flex", gap: 8 }}>
-                              <div style={{ flex: 1 }}>
-                                <label className="g-field-label">Peso</label>
-                                <input
-                                  className="g-input g-num-small"
-                                  type="number"
-                                  step="0.5"
-                                  value={editDraft.weight}
-                                  onChange={(e) => setEditDraft((d) => ({ ...d, weight: parseFloat(e.target.value) || 0 }))}
-                                />
-                              </div>
-                              <div style={{ flex: 1 }}>
-                                <label className="g-field-label">Serie</label>
-                                <input
-                                  className="g-input g-num-small"
-                                  type="number"
-                                  min="1"
-                                  value={editDraft.sets}
-                                  onChange={(e) => setEditDraft((d) => ({ ...d, sets: parseInt(e.target.value) || 1 }))}
-                                />
-                              </div>
-                              <div style={{ flex: 1 }}>
-                                <label className="g-field-label">Reps</label>
-                                <input
-                                  className="g-input g-num-small"
-                                  type="number"
-                                  min="1"
-                                  value={editDraft.reps}
-                                  onChange={(e) => setEditDraft((d) => ({ ...d, reps: parseInt(e.target.value) || 1 }))}
-                                />
-                              </div>
-                            </div>
-                            <label className="g-checkbox-row">
-                              <input
-                                type="checkbox"
-                                checked={editDraft.backoff}
-                                onChange={(e) => setEditDraft((d) => ({ ...d, backoff: e.target.checked }))}
-                              />
-                              Serie back-off
-                            </label>
-                            <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
-                              <button className="g-icon-btn" style={{ flex: 1, justifyContent: "center" }} onClick={cancelEditEntry}>
-                                Annulla
-                              </button>
-                              <button className="g-submit" style={{ flex: 1, marginTop: 0 }} onClick={saveEditEntry}>
-                                Salva
-                              </button>
-                            </div>
-                          </div>
-                        ) : (
-                          <div className="g-history-row" key={l.id}>
-                            <div className="g-history-main">
-                              <div className="g-history-ex">
-                                {l.exercise}
-                                {l.backoff && <span style={{ color: "var(--steel)", fontSize: 11 }}> · back-off</span>}
-                              </div>
-                              <div className="g-history-sets">{logSummary(l)}</div>
-                            </div>
-                            <div style={{ display: "flex", gap: 4 }}>
-                              <button className="g-del-btn" onClick={() => startEditEntry(l)} aria-label="Modifica">
-                                <Pencil size={15} />
-                              </button>
-                              <button
-                                className="g-del-btn"
-                                onClick={() => confirmThen(`Eliminare "${l.exercise}" da questo allenamento?`, () => onDelete(l.id))}
-                                aria-label="Elimina"
-                              >
-                                <Trash2 size={16} />
-                              </button>
-                            </div>
-                          </div>
-                        )
-                      )}
-
-                      {addingToKey === g.key ? (
-                        <div className="g-edit-row">
-                          <label className="g-field-label">Esercizio</label>
-                          <ExercisePicker
-                            exercises={exercises}
-                            value={addDraft.exercise}
-                            onChange={(v) => setAddDraft((d) => ({ ...d, exercise: v }))}
-                            placeholder=""
-                          />
-                          <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-                            <div style={{ flex: 1 }}>
-                              <label className="g-field-label">Peso</label>
-                              <input
-                                className="g-input g-num-small"
-                                type="number"
-                                step="0.5"
-                                value={addDraft.weight}
-                                onChange={(e) => setAddDraft((d) => ({ ...d, weight: parseFloat(e.target.value) || 0 }))}
-                              />
-                            </div>
-                            <div style={{ flex: 1 }}>
-                              <label className="g-field-label">Serie</label>
-                              <input
-                                className="g-input g-num-small"
-                                type="number"
-                                min="1"
-                                value={addDraft.sets}
-                                onChange={(e) => setAddDraft((d) => ({ ...d, sets: parseInt(e.target.value) || 1 }))}
-                              />
-                            </div>
-                            <div style={{ flex: 1 }}>
-                              <label className="g-field-label">Reps</label>
-                              <input
-                                className="g-input g-num-small"
-                                type="number"
-                                min="1"
-                                value={addDraft.reps}
-                                onChange={(e) => setAddDraft((d) => ({ ...d, reps: parseInt(e.target.value) || 1 }))}
-                              />
-                            </div>
-                          </div>
-                          <label className="g-checkbox-row">
-                            <input
-                              type="checkbox"
-                              checked={addDraft.backoff}
-                              onChange={(e) => setAddDraft((d) => ({ ...d, backoff: e.target.checked }))}
-                            />
-                            Serie back-off
-                          </label>
-                          <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
-                            <button className="g-icon-btn" style={{ flex: 1, justifyContent: "center" }} onClick={cancelAddToSession}>
-                              Annulla
-                            </button>
-                            <button
-                              className="g-submit"
-                              style={{ flex: 1, marginTop: 0 }}
-                              disabled={!addDraft.exercise.trim()}
-                              onClick={() => confirmAddToSession(g)}
-                            >
-                              Aggiungi
-                            </button>
-                          </div>
-                        </div>
-                      ) : (
-                        <button
-                          className="g-icon-btn"
-                          style={{ width: "100%", justifyContent: "center", marginTop: 4 }}
-                          onClick={() => startAddToSession(g)}
-                        >
-                          <Plus size={14} /> Aggiungi esercizio a questo allenamento
-                        </button>
-                      )}
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        )}
+        {renderStorico(false)}
       </div>
+        </>
+      )}
+
+      {addingExtra && (
+        <ExtraExerciseModal
+          exercises={exercises}
+          exerciseMeta={exerciseMeta}
+          exerciseGuide={exerciseGuide}
+          suggestWeight={ultimoPeso}
+          onOpenGuide={setGuideFor}
+          onAdd={confirmAddExtra}
+          onClose={() => setAddingExtra(false)}
+        />
+      )}
+
+      {addingToKey && (() => {
+        const group = sessionGroups.find((g) => g.key === addingToKey);
+        if (!group) return null;
+        return (
+          <ExtraExerciseModal
+            title="Aggiungi all'allenamento"
+            exercises={exercises}
+            exerciseMeta={exerciseMeta}
+            exerciseGuide={exerciseGuide}
+            suggestWeight={ultimoPeso}
+            onOpenGuide={setGuideFor}
+            onAdd={(entry) => confirmAddToSession(group, entry)}
+            onClose={() => setAddingToKey(null)}
+          />
+        );
+      })()}
 
       {guideFor && (
         <ExerciseGuideModal

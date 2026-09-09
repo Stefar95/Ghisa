@@ -3,6 +3,8 @@ import { Lock, Unlock } from "lucide-react";
 import ExerciseRegistry from "./ExerciseRegistry";
 import UserManagement from "./UserManagement";
 import DatabaseCleanup from "./DatabaseCleanup";
+import DeletedLogs from "./DeletedLogs";
+import AdminDataBrowser from "./AdminDataBrowser";
 
 export default function AdminPage({
   exercises,
@@ -85,6 +87,18 @@ export default function AdminPage({
             Utenti
           </div>
           <div
+            className={`g-admin-subtab ${section === "dati" ? "active" : ""}`}
+            onClick={() => setSection("dati")}
+          >
+            Dati
+          </div>
+          <div
+            className={`g-admin-subtab ${section === "cancellati" ? "active" : ""}`}
+            onClick={() => setSection("cancellati")}
+          >
+            Cancellati
+          </div>
+          <div
             className={`g-admin-subtab ${section === "pulizia" ? "active" : ""}`}
             onClick={() => setSection("pulizia")}
           >
@@ -113,6 +127,10 @@ export default function AdminPage({
       )}
 
       {isAdmin && section === "utenti" && <UserManagement currentUid={authUser.uid} />}
+
+      {isAdmin && section === "dati" && <AdminDataBrowser />}
+
+      {isAdmin && section === "cancellati" && <DeletedLogs />}
 
       {isAdmin && section === "pulizia" && <DatabaseCleanup onLocalWipe={onLocalWipe} />}
     </div>

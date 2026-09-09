@@ -1,9 +1,13 @@
 import { useState, useEffect } from "react";
-import { collection, onSnapshot, doc, setDoc } from "firebase/firestore";
+import { collection, onSnapshot } from "firebase/firestore";
 import { X, Copy } from "lucide-react";
 import { db } from "../firebase";
 import { uid, getDays } from "../lib/utils";
 
+// La copia è un documento scheda tutto nuovo (giusto: "duplica" deve creare
+// qualcosa di indipendente, non un altro alias della stessa). Se la si
+// assegna subito a qualcuno, quello sarà da subito l'UNICO documento che
+// vede anche lui — niente più "invio" separato da accettare.
 export default function DuplicateSchedaModal({ scheda, fromUser, canAssign, onClose, onDuplicate }) {
   const already = scheda.assignedTo || [];
   const [name, setName] = useState(`${scheda.name} (copia)`);
@@ -32,48 +36,24 @@ export default function DuplicateSchedaModal({ scheda, fromUser, canAssign, onCl
     return unsub;
   }, [canAssign, fromUser]);
 
-  // Invia una copia nella casella di consegna del destinatario
-  const sendTo = async (target, days) => {
-    const id = uid();
-    await setDoc(doc(db, "assignments", id), {
-      id,
-      toUid: target.uid,
-      fromName: fromUser?.displayName || fromUser?.email || "",
-      scheda: { name: name.trim(), days },
-      createdAt: Date.now(),
-    });
-  };
-
-  const confirm = async () => {
+  const confirm = () => {
     const finalName = name.trim() || `${scheda.name} (copia)`;
     const days = JSON.parse(JSON.stringify(getDays(scheda))).map((d) => ({ ...d, id: uid() }));
 
-    setBusy(true);
-    setError(null);
-    try {
-      let assignedTo = [];
-      if (dest === "same") {
-        assignedTo = already;
-        await Promise.all(already.map((t) => sendTo(t, days)));
-      } else if (dest === "other") {
-        const target = (users || []).find((u) => u.uid === targetUid);
-        if (!target) {
-          setError("Scegli una persona.");
-          setBusy(false);
-          return;
-        }
-        const info = { uid: target.uid, name: target.displayName || target.email || "Utente" };
-        assignedTo = [info];
-        await sendTo(info, days);
+    let assignedTo = [];
+    if (dest === "same") {
+      assignedTo = already;
+    } else if (dest === "other") {
+      const target = (users || []).find((u) => u.uid === targetUid);
+      if (!target) {
+        setError("Scegli una persona.");
+        return;
       }
-      onDuplicate({ id: uid(), name: finalName, days, assignedTo });
-      onClose();
-    } catch (e) {
-      console.error(e);
-      setError(e.message || String(e));
-    } finally {
-      setBusy(false);
+      assignedTo = [{ uid: target.uid, name: target.displayName || target.email || "Utente" }];
     }
+    setBusy(true);
+    onDuplicate({ id: uid(), name: finalName, days, assignedTo });
+    onClose();
   };
 
   return (

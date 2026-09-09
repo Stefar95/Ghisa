@@ -256,6 +256,73 @@ export function makeDay(name = "Giorno 1") {
   return { id: uid(), name, items: [] };
 }
 
+// Applica `mapPart` a ogni esercizio dentro ogni blocco di una scheda, senza
+// convertirne il formato (vecchio `items` in cima / nuovo `days`): serve per
+// operazioni che devono toccare TUTTE le schede, come rinominare o unire un
+// esercizio dall'Anagrafica. Un blocco "nuovo" ha sempre `parts` (anche con un
+// solo esercizio); un blocco davvero vecchio ha l'esercizio direttamente in
+// `exercise`. ⚠️ Non sostituire con un accesso diretto a `scheda.items`: le
+// schede con più giorni non hanno `items` in cima, solo dentro ogni `days[]`.
+function mapBlockExercises(block, mapPart) {
+  if (Array.isArray(block?.parts) && block.parts.length) {
+    return { ...block, parts: block.parts.map(mapPart) };
+  }
+  if (block?.exercise) return mapPart(block);
+  return block;
+}
+
+export function mapSchedaExercises(scheda, mapPart) {
+  if (Array.isArray(scheda.days)) {
+    return {
+      ...scheda,
+      days: scheda.days.map((d) => ({ ...d, items: (d.items || []).map((b) => mapBlockExercises(b, mapPart)) })),
+    };
+  }
+  if (Array.isArray(scheda.items)) {
+    return { ...scheda, items: scheda.items.map((b) => mapBlockExercises(b, mapPart)) };
+  }
+  return scheda;
+}
+
+// Riassunto leggibile di cosa è cambiato tra due versioni di una scheda, per
+// lo storico delle modifiche (Cronologia). Confronta solo cose visibili
+// all'utente (nome, giorni aggiunti/rimossi/rinominati/modificati): non è un
+// diff esercizio-per-esercizio, basta a capire "cosa" senza appesantire troppo.
+export function summarizeSchedaDiff(before, after) {
+  if (!before) return "Scheda creata";
+  const parts = [];
+  if ((before.name || "") !== (after.name || "")) parts.push(`nome → "${after.name}"`);
+  const beforeDays = getDays(before);
+  const afterDays = getDays(after);
+  const beforeById = new Map(beforeDays.map((d) => [d.id, d]));
+  const afterIds = new Set();
+  afterDays.forEach((d) => {
+    afterIds.add(d.id);
+    const old = beforeById.get(d.id);
+    if (!old) {
+      parts.push(`giorno "${d.name}" aggiunto`);
+    } else if (old.name !== d.name) {
+      parts.push(`giorno "${old.name}" rinominato in "${d.name}"`);
+    } else if (JSON.stringify(old.items) !== JSON.stringify(d.items)) {
+      parts.push(`giorno "${d.name}" modificato`);
+    }
+  });
+  beforeDays.forEach((d) => {
+    if (!afterIds.has(d.id)) parts.push(`giorno "${d.name}" rimosso`);
+  });
+  if (parts.length === 0) return "Nessuna modifica rilevante";
+  if (parts.length > 4) return `${parts.slice(0, 4).join("; ")}; +${parts.length - 4} altro`;
+  return parts.join("; ");
+}
+
+// Aggiunge una voce alla cronologia di una scheda (chi, quando, cosa), usata
+// da App.jsx ogni volta che una scheda viene salvata/aggiornata. Tenuta corta
+// (30 voci) per non far crescere il documento all'infinito.
+export function withSchedaHistory(scheda, before, byName) {
+  const entry = { at: Date.now(), byName, summary: summarizeSchedaDiff(before, scheda) };
+  return { ...scheda, history: [entry, ...(before?.history || [])].slice(0, 30) };
+}
+
 // Elenco piatto dei giorni di tutte le schede, per il menu in allenamento
 export function dayOptions(schede) {
   const out = [];
